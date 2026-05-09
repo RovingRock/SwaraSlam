@@ -343,6 +343,7 @@ export default function SwaraSlamApp() {
   const [confetti,        setConfetti]       = useState(false);
   const [allLevelsUp,     setAllLevelsUp]    = useState(false);
   const [showInstallBanner, setShowInstallBanner] = useState(false);
+  const [deferredPrompt, setDeferredPrompt] = useState(null);
 
   // ── Refs
   const appRef       = useRef(null);
@@ -379,10 +380,57 @@ export default function SwaraSlamApp() {
   // ── Detect Safari and show install banner if not in PWA mode
   useEffect(() => {
     const isPWA = window.matchMedia('(display-mode: standalone)').matches;
-    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     const dismissed = localStorage.getItem('installBannerDismissed');
+    
+    // Listen for Chrome's install prompt event
+    const handleBeforeInstallPrompt = (e) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+      if (!dismissed) setShowInstallBanner(true);
+    };
+    
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    
+    // For Safari (no beforeinstallprompt event)
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     if (!isPWA && isSafari && !dismissed) {
       setTimeout(() => setShowInstallBanner(true), 2000);
+    }
+    
+    return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+  }, []);
+
+  const handleInstall = useCallback(async () => {
+    if (!deferredPrompt) {
+      // Safari fallback — show alert with instructions
+      alert('To install:\n\n1. Tap the Share button\n2. Scroll and tap "Add to Home Screen"\n3. Tap "Add"');
+      return;
+    }
+    // Chrome — trigger native install prompt
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    if (outcome === 'accepted') {
+      setShowInstallBanner(false);
+      localStorage.setItem('installBannerDismissed', 'true');
+    }
+    setDeferredPrompt(null);
+  }, [deferredPrompt]);
+
+  const handleShare = useCallback(async () => {
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'Swara Slam',
+          text: 'Swara expertise for Vocalists and Instrumentalists',
+          url: window.location.href,
+        });
+      } catch (err) {
+        if (err.name !== 'AbortError') console.error('Share failed:', err);
+      }
+    } else {
+      // Fallback — copy link
+      navigator.clipboard.writeText(window.location.href);
+      alert('Link copied to clipboard!');
     }
   }, []);
 
@@ -765,26 +813,50 @@ export default function SwaraSlamApp() {
 
         .module-tag{font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:rgba(0,0,0,.18);margin-top:1.75rem}
 
-        /* Install banner for Safari */
+        /* Install banner */
         .install-banner{
           position:fixed;bottom:0;left:0;right:0;
           background:linear-gradient(135deg,#C05F2F,#9A7B50);
-          color:#fff;padding:14px 20px;
-          display:flex;align-items:center;justify-content:space-between;
-          box-shadow:0 -2px 20px rgba(0,0,0,.2);
+          color:#fff;padding:16px 20px;
+          box-shadow:0 -2px 20px rgba(0,0,0,.25);
           z-index:150;
           animation:slideUp .3s ease both;
+          display:flex;flex-direction:column;gap:12px;
         }
         @keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
-        .install-banner-text{font-size:13px;line-height:1.4;flex:1;padding-right:12px}
-        .install-banner-text strong{font-weight:600;display:block;margin-bottom:2px}
+        
+        .install-banner-header{
+          display:flex;align-items:center;justify-content:space-between;
+        }
+        .install-banner-title{
+          font-size:15px;font-weight:600;letter-spacing:.02em;
+        }
         .install-close{
-          background:rgba(255,255,255,.2);border:none;color:#fff;
-          width:32px;height:32px;border-radius:50%;
-          cursor:pointer;font-size:18px;line-height:1;
+          background:rgba(255,255,255,.15);border:none;color:#fff;
+          width:28px;height:28px;border-radius:50%;
+          cursor:pointer;font-size:16px;line-height:1;
           transition:background .15s;flex-shrink:0;
         }
-        .install-close:hover{background:rgba(255,255,255,.3)}
+        .install-close:hover{background:rgba(255,255,255,.25)}
+        
+        .install-buttons{
+          display:flex;gap:10px;
+        }
+        .install-btn{
+          flex:1;
+          background:rgba(255,255,255,.95);
+          color:#1C1A17;
+          border:none;border-radius:8px;
+          padding:12px 16px;
+          font-family:'DM Sans',sans-serif;
+          font-size:14px;font-weight:600;
+          cursor:pointer;
+          transition:background .15s,transform .1s;
+          display:flex;align-items:center;justify-content:center;gap:6px;
+        }
+        .install-btn:hover{background:#fff;transform:translateY(-1px)}
+        .install-btn:active{transform:translateY(0)}
+        .install-btn svg{width:16px;height:16px;flex-shrink:0}
 
         @media(min-width:480px){.card-grid{gap:9px}}
         @media(min-width:768px){.arena-field{max-width:540px;padding:20px 18px}.card-grid{gap:11px}.ss-controls{max-width:540px}}
@@ -794,16 +866,33 @@ export default function SwaraSlamApp() {
       {/* Confetti */}
       <Confetti active={confetti} />
 
-      {/* Install banner for Safari users */}
+      {/* Install banner */}
       {showInstallBanner && (
         <div className="install-banner">
-          <div className="install-banner-text">
-            <strong>Install Swara Slam</strong>
-            Tap <strong>Share</strong> → <strong>Add to Home Screen</strong>
+          <div className="install-banner-header">
+            <span className="install-banner-title">Install Swara Slam</span>
+            <button className="install-close" onClick={dismissInstallBanner} aria-label="Dismiss">✕</button>
           </div>
-          <button className="install-close" onClick={dismissInstallBanner} aria-label="Dismiss">
-            ✕
-          </button>
+          <div className="install-buttons">
+            <button className="install-btn" onClick={handleInstall}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Add to Home
+            </button>
+            <button className="install-btn" onClick={handleShare}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="18" cy="5" r="3"/>
+                <circle cx="6" cy="12" r="3"/>
+                <circle cx="18" cy="19" r="3"/>
+                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+              </svg>
+              Share
+            </button>
+          </div>
         </div>
       )}
 
