@@ -342,6 +342,7 @@ export default function SwaraSlamApp() {
   const [levelUpVisible, setLevelUpVisible] = useState(false);
   const [confetti,        setConfetti]       = useState(false);
   const [allLevelsUp,     setAllLevelsUp]    = useState(false);
+  const [showInstallBanner, setShowInstallBanner] = useState(false);
 
   // ── Refs
   const appRef       = useRef(null);
@@ -374,6 +375,21 @@ export default function SwaraSlamApp() {
 
   // ── Cleanup on unmount
   useEffect(() => () => { engine.stopScheduler(); engine.stopDrone(); }, []);
+
+  // ── Detect Safari and show install banner if not in PWA mode
+  useEffect(() => {
+    const isPWA = window.matchMedia('(display-mode: standalone)').matches;
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    const dismissed = localStorage.getItem('installBannerDismissed');
+    if (!isPWA && isSafari && !dismissed) {
+      setTimeout(() => setShowInstallBanner(true), 2000);
+    }
+  }, []);
+
+  const dismissInstallBanner = useCallback(() => {
+    setShowInstallBanner(false);
+    localStorage.setItem('installBannerDismissed', 'true');
+  }, []);
 
   // ── Flash BPM when set changes (not on first load)
   const prevSetRef = useRef(-1);
@@ -749,6 +765,27 @@ export default function SwaraSlamApp() {
 
         .module-tag{font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:rgba(0,0,0,.18);margin-top:1.75rem}
 
+        /* Install banner for Safari */
+        .install-banner{
+          position:fixed;bottom:0;left:0;right:0;
+          background:linear-gradient(135deg,#C05F2F,#9A7B50);
+          color:#fff;padding:14px 20px;
+          display:flex;align-items:center;justify-content:space-between;
+          box-shadow:0 -2px 20px rgba(0,0,0,.2);
+          z-index:150;
+          animation:slideUp .3s ease both;
+        }
+        @keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+        .install-banner-text{font-size:13px;line-height:1.4;flex:1;padding-right:12px}
+        .install-banner-text strong{font-weight:600;display:block;margin-bottom:2px}
+        .install-close{
+          background:rgba(255,255,255,.2);border:none;color:#fff;
+          width:32px;height:32px;border-radius:50%;
+          cursor:pointer;font-size:18px;line-height:1;
+          transition:background .15s;flex-shrink:0;
+        }
+        .install-close:hover{background:rgba(255,255,255,.3)}
+
         @media(min-width:480px){.card-grid{gap:9px}}
         @media(min-width:768px){.arena-field{max-width:540px;padding:20px 18px}.card-grid{gap:11px}.ss-controls{max-width:540px}}
         @media(min-width:1200px){.arena-field{max-width:620px;padding:24px 22px}.card-grid{gap:13px}.ss-controls{max-width:580px}}
@@ -756,6 +793,19 @@ export default function SwaraSlamApp() {
 
       {/* Confetti */}
       <Confetti active={confetti} />
+
+      {/* Install banner for Safari users */}
+      {showInstallBanner && (
+        <div className="install-banner">
+          <div className="install-banner-text">
+            <strong>Install Swara Slam</strong>
+            Tap <strong>Share</strong> → <strong>Add to Home Screen</strong>
+          </div>
+          <button className="install-close" onClick={dismissInstallBanner} aria-label="Dismiss">
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* BPM flash */}
       <BpmFlash bpm={manualBpm ? bpm : autoBpm} visible={bpmFlash} />
