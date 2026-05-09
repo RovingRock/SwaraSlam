@@ -377,43 +377,52 @@ export default function SwaraSlamApp() {
   // ── Cleanup on unmount
   useEffect(() => () => { engine.stopScheduler(); engine.stopDrone(); }, []);
 
-  // ── Detect Safari and show install banner if not in PWA mode
+  // ── Install banner detection
   useEffect(() => {
     const isPWA = window.matchMedia('(display-mode: standalone)').matches;
+    if (isPWA) return; // Already installed — never show banner
+
     const dismissed = localStorage.getItem('installBannerDismissed');
-    
-    // Listen for Chrome's install prompt event
+    if (dismissed) return;
+
+    // Chrome / Edge / Android — capture deferred prompt
     const handleBeforeInstallPrompt = (e) => {
       e.preventDefault();
       setDeferredPrompt(e);
-      if (!dismissed) setShowInstallBanner(true);
+      setTimeout(() => setShowInstallBanner(true), 2000);
     };
-    
     window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
-    
-    // For Safari (no beforeinstallprompt event)
+
+    // Safari (iOS + macOS) — no beforeinstallprompt, show banner manually
     const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-    if (!isPWA && isSafari && !dismissed) {
+    const isIOS    = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    if (isSafari || isIOS) {
       setTimeout(() => setShowInstallBanner(true), 2000);
     }
-    
+
     return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
   }, []);
 
   const handleInstall = useCallback(async () => {
-    if (!deferredPrompt) {
-      // Safari fallback — show alert with instructions
-      alert('To install:\n\n1. Tap the Share button\n2. Scroll and tap "Add to Home Screen"\n3. Tap "Add"');
-      return;
+    if (deferredPrompt) {
+      // Chrome / Edge / Android — native prompt
+      deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      if (outcome === 'accepted') {
+        setShowInstallBanner(false);
+        localStorage.setItem('installBannerDismissed', 'true');
+      }
+      setDeferredPrompt(null);
+    } else {
+      // Safari iOS
+      const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+      if (isIOS) {
+        alert('To install on iPhone:\n\n1. Tap the Share icon (□↑) at the bottom of Safari\n2. Scroll down and tap "Add to Home Screen"\n3. Tap "Add" — the app icon appears on your home screen\n\nOpening from that icon gives you the full app experience.');
+      } else {
+        // Safari macOS
+        alert('To install on Mac:\n\n1. In Safari menu bar click File\n2. Click "Add to Dock"\n\nOr bookmark this page for quick access.');
+      }
     }
-    // Chrome — trigger native install prompt
-    deferredPrompt.prompt();
-    const { outcome } = await deferredPrompt.userChoice;
-    if (outcome === 'accepted') {
-      setShowInstallBanner(false);
-      localStorage.setItem('installBannerDismissed', 'true');
-    }
-    setDeferredPrompt(null);
   }, [deferredPrompt]);
 
   const handleShare = useCallback(async () => {
