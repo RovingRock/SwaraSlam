@@ -342,7 +342,7 @@ export default function SwaraSlamApp() {
   const [levelUpVisible, setLevelUpVisible] = useState(false);
   const [confetti,        setConfetti]       = useState(false);
   const [allLevelsUp,     setAllLevelsUp]    = useState(false);
-  const [showInstallBanner, setShowInstallBanner] = useState(false);
+  const [showGetReady, setShowGetReady] = useState(false);
   const [deferredPrompt, setDeferredPrompt] = useState(null);
 
   // ── Refs
@@ -924,6 +924,18 @@ export default function SwaraSlamApp() {
         </div>
       )}
 
+      {/* Get Ready overlay */}
+      {showGetReady && (
+        <div className="levelup-overlay">
+          <p className="levelup-ornament">स &nbsp; र &nbsp; ग &nbsp; म</p>
+          <div className="getready-label">Ready?</div>
+          <div className="levelup-title" style={{fontSize:"clamp(36px,9vw,68px)"}}>
+            Level 1 coming up
+          </div>
+          <p className="levelup-sub">{LEVEL_CONFIG[0].label} Swaras · 80 BPM</p>
+        </div>
+      )}
+
       {/* All Levels Up overlay */}
       {allLevelsUp && (
         <div className="levelup-overlay">
@@ -944,7 +956,12 @@ export default function SwaraSlamApp() {
             <span className="start-slam">Slam</span>
           </div>
           <p className="start-sub">Swara expertise for Vocalists and Instrumentalists</p>
-          <button className="start-btn" onClick={() => { toggleFullscreen(); setStarted(true); }}>
+          <button className="start-btn" onClick={() => {
+            toggleFullscreen();
+            setStarted(true);
+            setShowGetReady(true);
+            setTimeout(() => setShowGetReady(false), 2200);
+          }}>
             <Maximize /> Start Practice
           </button>
           <p className="start-ornament" style={{marginTop:"1rem",fontSize:"10px",letterSpacing:".2em"}}>
