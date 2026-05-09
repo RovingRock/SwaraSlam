@@ -298,7 +298,6 @@ export default function SwaraSlamApp() {
   const [levelUpVisible,setLevelUpVisible]= useState(false);
   const [confetti,      setConfetti]      = useState(false);
   const [allLevelsUp,   setAllLevelsUp]   = useState(false);
-  const [showGetReady,  setShowGetReady]  = useState(false);
   const [showInstallBanner, setShowInstallBanner] = useState(false);
   const [deferredPrompt,    setDeferredPrompt]    = useState(null);
 
