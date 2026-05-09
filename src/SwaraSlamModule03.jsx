@@ -359,8 +359,12 @@ export default function SwaraSlamApp() {
 
   // ── Fullscreen
   const toggleFullscreen = useCallback(() => {
-    if (!document.fullscreenElement) appRef.current?.requestFullscreen().catch(()=>{});
-    else document.exitFullscreen().catch(()=>{});
+    // iOS Safari does not support requestFullscreen — skip silently
+    if (!document.fullscreenElement) {
+      appRef.current?.requestFullscreen?.().catch(()=>{});
+    } else {
+      document.exitFullscreen?.().catch(()=>{});
+    }
   }, []);
   useEffect(() => {
     const h = () => setIsFullscreen(!!document.fullscreenElement);
@@ -722,14 +726,23 @@ export default function SwaraSlamApp() {
         @keyframes titlePop{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:scale(1)}}
 
         /* Start overlay */
-        .start-overlay{position:fixed;inset:0;background:#F9F7F2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.25rem;z-index:100}
+        .start-overlay{
+          position:fixed;inset:0;background:#F9F7F2;
+          display:flex;flex-direction:column;
+          align-items:center;justify-content:center;
+          gap:1.25rem;z-index:100;
+          padding:0 1.5rem;text-align:center;
+        }
         .start-ornament{font-family:'Cormorant Garamond',serif;font-size:13px;color:rgba(0,0,0,.18);letter-spacing:.35em}
         .start-raaguru{font-family:'DM Sans',sans-serif;font-size:11px;font-weight:500;letter-spacing:.22em;text-transform:uppercase;color:#9A7B50}
         .start-raaguru em{font-style:normal;color:#C05F2F}
         .start-title{display:flex;align-items:baseline;gap:10px}
         .start-swara{font-family:'Cormorant Garamond',serif;font-size:clamp(52px,11vw,84px);font-weight:600;color:#1C1A17}
         .start-slam{font-family:'Cormorant Garamond',serif;font-size:clamp(52px,11vw,84px);font-weight:600;font-style:italic;color:#C05F2F}
-        .start-sub{font-size:11px;color:#9A7B50;letter-spacing:.2em;text-transform:uppercase}
+        .start-sub{
+          font-size:11px;color:#9A7B50;letter-spacing:.12em;text-transform:uppercase;
+          text-align:center;padding:0 1.5rem;line-height:1.6;max-width:280px;
+        }
         .start-btn{margin-top:.5rem;padding:14px 40px;border-radius:99px;background:#1C1A17;border:none;color:#F9F7F2;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:500;letter-spacing:.06em;cursor:pointer;transition:background .18s,transform .12s;display:flex;align-items:center;gap:8px}
         .start-btn:hover{background:#C05F2F;transform:scale(1.03)}
         .start-btn:active{transform:scale(.97)}
