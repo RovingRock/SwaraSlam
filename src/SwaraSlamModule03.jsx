@@ -174,9 +174,9 @@ function useAudioEngine() {
     stopDrone();
     const ctx = getCtx();
     const master = ctx.createGain();
-    master.gain.setValueAtTime(0.16, ctx.currentTime);
+    master.gain.setValueAtTime(0.28, ctx.currentTime);
     master.connect(ctx.destination);
-    [[1,.18],[2,.07],[3,.04],[5,.025]].forEach(([m,a]) => {
+    [[1,.28],[2,.11],[3,.06],[5,.035]].forEach(([m,a]) => {
       const o = ctx.createOscillator(), g = ctx.createGain();
       o.type = "sine"; o.frequency.setValueAtTime(freq*m, ctx.currentTime);
       g.gain.setValueAtTime(a, ctx.currentTime);
@@ -380,32 +380,22 @@ export default function SwaraSlamApp() {
   // ── Install banner detection
   useEffect(() => {
     const isPWA = window.matchMedia('(display-mode: standalone)').matches;
-    if (isPWA) return; // Already installed — never show banner
-
+    if (isPWA) return;
     const dismissed = localStorage.getItem('installBannerDismissed');
     if (dismissed) return;
+    // Show for everyone who hasn't installed / dismissed
+    setTimeout(() => setShowInstallBanner(true), 2500);
 
-    // Chrome / Edge / Android — capture deferred prompt
     const handleBeforeInstallPrompt = (e) => {
       e.preventDefault();
       setDeferredPrompt(e);
-      setTimeout(() => setShowInstallBanner(true), 2000);
     };
     window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
-
-    // Safari (iOS + macOS) — no beforeinstallprompt, show banner manually
-    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-    const isIOS    = /iphone|ipad|ipod/i.test(navigator.userAgent);
-    if (isSafari || isIOS) {
-      setTimeout(() => setShowInstallBanner(true), 2000);
-    }
-
     return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
   }, []);
 
   const handleInstall = useCallback(async () => {
     if (deferredPrompt) {
-      // Chrome / Edge / Android — native prompt
       deferredPrompt.prompt();
       const { outcome } = await deferredPrompt.userChoice;
       if (outcome === 'accepted') {
@@ -413,16 +403,8 @@ export default function SwaraSlamApp() {
         localStorage.setItem('installBannerDismissed', 'true');
       }
       setDeferredPrompt(null);
-    } else {
-      // Safari iOS
-      const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
-      if (isIOS) {
-        alert('To install on iPhone:\n\n1. Tap the Share icon (□↑) at the bottom of Safari\n2. Scroll down and tap "Add to Home Screen"\n3. Tap "Add" — the app icon appears on your home screen\n\nOpening from that icon gives you the full app experience.');
-      } else {
-        // Safari macOS
-        alert('To install on Mac:\n\n1. In Safari menu bar click File\n2. Click "Add to Dock"\n\nOr bookmark this page for quick access.');
-      }
     }
+    // For Safari — the banner itself IS the instruction, no extra action needed
   }, [deferredPrompt]);
 
   const handleShare = useCallback(async () => {
@@ -822,50 +804,58 @@ export default function SwaraSlamApp() {
 
         .module-tag{font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:rgba(0,0,0,.18);margin-top:1.75rem}
 
-        /* Install banner */
-        .install-banner{
-          position:fixed;bottom:0;left:0;right:0;
-          background:linear-gradient(135deg,#C05F2F,#9A7B50);
-          color:#fff;padding:16px 20px;
-          box-shadow:0 -2px 20px rgba(0,0,0,.25);
+        /* Install tooltip */
+        .install-tooltip{
+          position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+          width:calc(100% - 40px);max-width:360px;
+          background:#1C1A17;color:#F9F7F2;
+          border-radius:16px;padding:20px;
+          box-shadow:0 8px 40px rgba(0,0,0,.35);
           z-index:150;
-          animation:slideUp .3s ease both;
-          display:flex;flex-direction:column;gap:12px;
+          animation:slideUp .35s cubic-bezier(.34,1.56,.64,1) both;
         }
-        @keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
-        
-        .install-banner-header{
-          display:flex;align-items:center;justify-content:space-between;
-        }
-        .install-banner-title{
-          font-size:15px;font-weight:600;letter-spacing:.02em;
+        @keyframes slideUp{from{opacity:0;transform:translateX(-50%) translateY(20px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+        .install-tooltip-title{
+          font-family:'Cormorant Garamond',serif;
+          font-size:20px;font-weight:600;font-style:italic;
+          color:#F9F7F2;margin-bottom:14px;
         }
         .install-close{
-          background:rgba(255,255,255,.15);border:none;color:#fff;
-          width:28px;height:28px;border-radius:50%;
-          cursor:pointer;font-size:16px;line-height:1;
+          position:absolute;top:14px;right:14px;
+          background:rgba(255,255,255,.1);border:none;color:#F9F7F2;
+          width:26px;height:26px;border-radius:50%;
+          cursor:pointer;font-size:14px;
           transition:background .15s;flex-shrink:0;
         }
-        .install-close:hover{background:rgba(255,255,255,.25)}
-        
-        .install-buttons{
-          display:flex;gap:10px;
+        .install-close:hover{background:rgba(255,255,255,.2)}
+        .install-steps{display:flex;flex-direction:column;gap:10px}
+        .install-step{display:flex;align-items:flex-start;gap:10px;font-size:13px;line-height:1.4;color:rgba(255,255,255,.85)}
+        .install-step-num{
+          background:#C05F2F;color:#fff;
+          width:20px;height:20px;border-radius:50%;
+          font-size:11px;font-weight:700;
+          display:flex;align-items:center;justify-content:center;
+          flex-shrink:0;margin-top:1px;
         }
+        .install-step strong{color:#fff}
+        .share-icon-inline{
+          width:14px;height:14px;display:inline;
+          vertical-align:middle;margin:0 2px;
+          stroke:#C05F2F;
+        }
+        .install-buttons{display:flex;gap:8px}
         .install-btn{
-          flex:1;
-          background:rgba(255,255,255,.95);
-          color:#1C1A17;
+          flex:1;background:#C05F2F;color:#fff;
           border:none;border-radius:8px;
-          padding:12px 16px;
-          font-family:'DM Sans',sans-serif;
-          font-size:14px;font-weight:600;
-          cursor:pointer;
-          transition:background .15s,transform .1s;
+          padding:11px 14px;
+          font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;
+          cursor:pointer;transition:background .15s;
           display:flex;align-items:center;justify-content:center;gap:6px;
         }
-        .install-btn:hover{background:#fff;transform:translateY(-1px)}
-        .install-btn:active{transform:translateY(0)}
-        .install-btn svg{width:16px;height:16px;flex-shrink:0}
+        .install-btn:hover{background:#A0472A}
+        .install-btn svg{width:15px;height:15px;flex-shrink:0}
+        .install-btn-share{background:rgba(255,255,255,.12)}
+        .install-btn-share:hover{background:rgba(255,255,255,.2)}
 
         @media(min-width:480px){.card-grid{gap:9px}}
         @media(min-width:768px){.arena-field{max-width:540px;padding:20px 18px}.card-grid{gap:11px}.ss-controls{max-width:540px}}
@@ -875,33 +865,48 @@ export default function SwaraSlamApp() {
       {/* Confetti */}
       <Confetti active={confetti} />
 
-      {/* Install banner */}
+      {/* Install tooltip */}
       {showInstallBanner && (
-        <div className="install-banner">
-          <div className="install-banner-header">
-            <span className="install-banner-title">Install Swara Slam</span>
-            <button className="install-close" onClick={dismissInstallBanner} aria-label="Dismiss">✕</button>
-          </div>
-          <div className="install-buttons">
-            <button className="install-btn" onClick={handleInstall}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="7 10 12 15 17 10"/>
-                <line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-              Add to Home
-            </button>
-            <button className="install-btn" onClick={handleShare}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="18" cy="5" r="3"/>
-                <circle cx="6" cy="12" r="3"/>
-                <circle cx="18" cy="19" r="3"/>
-                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
-                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
-              </svg>
-              Share
-            </button>
-          </div>
+        <div className="install-tooltip">
+          <button className="install-close" onClick={dismissInstallBanner} aria-label="Dismiss">✕</button>
+          <p className="install-tooltip-title">Install Swara Slam</p>
+          {deferredPrompt ? (
+            // Chrome / Android — show install button
+            <div className="install-buttons">
+              <button className="install-btn" onClick={handleInstall}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Add to Home Screen
+              </button>
+              <button className="install-btn install-btn-share" onClick={handleShare}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+                Share
+              </button>
+            </div>
+          ) : (
+            // Safari — visual step guide
+            <div className="install-steps">
+              <div className="install-step">
+                <span className="install-step-num">1</span>
+                <span>Tap the <strong>Share</strong> icon
+                  <svg className="share-icon-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+                  in your browser
+                </span>
+              </div>
+              <div className="install-step">
+                <span className="install-step-num">2</span>
+                <span>Tap <strong>"Add to Home Screen"</strong></span>
+              </div>
+              <div className="install-step">
+                <span className="install-step-num">3</span>
+                <span>Tap <strong>"Add"</strong> — opens like a native app ✓</span>
+              </div>
+              <button className="install-btn install-btn-share" onClick={handleShare} style={{marginTop:"8px"}}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+                Share App
+              </button>
+            </div>
+          )}
+          <div className="install-tooltip-arrow"/>
         </div>
       )}
 
