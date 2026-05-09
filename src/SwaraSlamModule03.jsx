@@ -298,16 +298,21 @@ export default function SwaraSlamApp() {
   const [levelUpVisible,setLevelUpVisible]= useState(false);
   const [confetti,      setConfetti]      = useState(false);
   const [allLevelsUp,   setAllLevelsUp]   = useState(false);
+  const [showGetReady,  setShowGetReady]  = useState(false);
   const [showInstallBanner, setShowInstallBanner] = useState(false);
   const [deferredPrompt,    setDeferredPrompt]    = useState(null);
 
   const appRef      = useRef(null);
   const saIdxRef    = useRef(saIndex);
   const cardsRef    = useRef(cards);
+  const levelRef    = useRef(level);
+  const setNumRef   = useRef(setNum);
   const engine      = useAudioEngine();
 
   saIdxRef.current  = saIndex;
   cardsRef.current  = cards;
+  levelRef.current  = level;
+  setNumRef.current = setNum;
 
   const autoBpm = BASE_BPM + setNum * BPM_INCREMENT;
 
@@ -454,10 +459,10 @@ export default function SwaraSlamApp() {
         setActiveCard(-1);
         setDotBeat(-1);
         engine.stopDrone();
-        setLevel(lvl => {
-          setSetNum(sn => { advanceSet(lvl, sn); return sn; });
-          return lvl;
-        });
+        // Read level/setNum via refs to avoid stale closure
+        const currentLevel = levelRef.current;
+        const currentSet   = setNumRef.current;
+        advanceSet(currentLevel, currentSet);
       }
     );
   }, [engine, droneOn, bpm, manualBpm, autoBpm, level, advanceSet]);
@@ -648,6 +653,15 @@ export default function SwaraSlamApp() {
           <p className="getready-eyebrow">Ready?</p>
           <div className="levelup-title">Level 1 coming up</div>
           <p className="levelup-sub">{LEVEL_CONFIG[0].label} Swaras &middot; {BASE_BPM} BPM</p>
+        </div>
+      )}
+
+      {/* Get Ready overlay */}
+      {showGetReady && (
+        <div className="levelup-overlay">
+          <p className="levelup-ornament">स &nbsp; र &nbsp; ग &nbsp; म</p>
+          <div className="levelup-title">Ready?</div>
+          <p className="levelup-sub">Level 1 coming up &mdash; {LEVEL_CONFIG[0].label}</p>
         </div>
       )}
 
