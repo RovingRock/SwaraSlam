@@ -134,7 +134,7 @@ function PaywallScreen({ onCheckout, redirecting }) {
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>24-HOUR PASS</div>
           <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:38,fontWeight:600,color:"#1C1A17",lineHeight:1,marginBottom:4}}>$1.99</div>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:"#6B6560",marginBottom:16}}>Try all levels for a day</div>
-          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpDNCevGY65XqMdTh1x4Qb")}
+          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpF4CevGY65XqM13lijglp")}
             style={{...btnBase,background:"#9A7B50"}}>
             {redirecting ? "Redirecting…" : "Get 24-Hour Access"}
           </button>
@@ -147,7 +147,7 @@ function PaywallScreen({ onCheckout, redirecting }) {
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#C05F2F",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>LIFETIME ACCESS</div>
           <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:38,fontWeight:600,color:"#C05F2F",lineHeight:1,marginBottom:4}}>$9.99</div>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:"#6B6560",marginBottom:16}}>Unlock forever</div>
-          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpBKCevGY65XqMA79vW9Rt")}
+          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpF0CevGY65XqMgLukQcWc")}
             style={{...btnBase,background:"#C05F2F",boxShadow:"0 4px 12px rgba(192,95,47,0.3)"}}>
             {redirecting ? "Redirecting…" : "✦ Get Lifetime Access"}
           </button>
@@ -468,7 +468,14 @@ export default function SwaraSlamApp() {
       supabase.auth.getSession().then(({ data: { session } }) => {
         if (session?.user) {
           loadProfile(session.user.id).then(premium => {
-            if (premium) { alert("🎉 Premium unlocked! All levels are now available."); setScreen("game"); }
+            if (premium) {
+              // Trigger confetti celebration
+              setConfetti(true);
+              setTimeout(() => setConfetti(false), 3500);
+              // Show success screen, then route to game
+              setScreen("premium-unlocked");
+              setTimeout(() => setScreen("game"), 3500);
+            }
           });
         }
       });
@@ -670,26 +677,55 @@ export default function SwaraSlamApp() {
 
   // Stripe checkout — user is guaranteed logged in when PaywallScreen is shown
   const handleStripeCheckout = useCallback(async (priceId) => {
-    const { data: { session }, error: se } = await supabase.auth.getSession();
-    if (se || !session?.user?.id) {
-      console.error("No session at checkout — routing to auth");
-      setScreen("auth"); return;
-    }
     setPaywallRedirecting(true);
     try {
-      const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/create-checkout`, {
-        method:"POST",
-        headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${session.access_token}` },
-        body: JSON.stringify({ priceId }),
-      });
-      if (!res.ok) throw new Error(`Server error: ${res.status} — ${await res.text()}`);
-      const data = await res.json();
-      if (!data.url) throw new Error("No checkout URL received");
-      window.location.href = data.url;
+      // Always refresh first — avoids stale token 401s after auth redirects
+      const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession();
+      const session = refreshData?.session;
+
+      if (refreshErr || !session?.access_token) {
+        // Refresh failed — fall back to getSession
+        const { data: { session: fallback }, error: se } = await supabase.auth.getSession();
+        if (se || !fallback?.access_token) {
+          console.error("No valid session at checkout:", se);
+          setPaywallRedirecting(false);
+          setScreen("auth");
+          return;
+        }
+        // Use fallback session
+        return doCheckout(priceId, fallback.access_token);
+      }
+
+      return doCheckout(priceId, session.access_token);
     } catch (err) {
-      console.error("Stripe error:", err);
+      console.error("Stripe checkout error:", err);
       alert(`Payment setup failed: ${err.message}`);
       setPaywallRedirecting(false);
+    }
+
+    async function doCheckout(priceId, token) {
+      try {
+        const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/create-checkout`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`,
+          },
+          body: JSON.stringify({ priceId }),
+        });
+        if (!res.ok) {
+          const errBody = await res.text();
+          console.error("Edge function error:", res.status, errBody);
+          throw new Error(`Server error: ${res.status} — ${errBody}`);
+        }
+        const data = await res.json();
+        if (!data.url) throw new Error("No checkout URL received from server");
+        window.location.href = data.url;
+      } catch (err) {
+        console.error("doCheckout error:", err);
+        alert(`Payment setup failed: ${err.message}`);
+        setPaywallRedirecting(false);
+      }
     }
   }, []);
 
@@ -968,6 +1004,22 @@ export default function SwaraSlamApp() {
             Begin ▶
           </button>
           <button className="ghost-btn" style={{marginTop:8}} onClick={() => setScreen("home")}>← Back</button>
+        </div>
+      )}
+
+      {/* PREMIUM UNLOCKED — celebration screen */}
+      {screen === "premium-unlocked" && (
+        <div className="screen">
+          <div style={{fontSize:64,marginBottom:16}}>🎉</div>
+          <div className="ready-title" style={{color:"#C05F2F",fontSize:"clamp(48px,10vw,72px)"}}>Premium Unlocked!</div>
+          <p className="ready-sub" style={{maxWidth:320,lineHeight:1.7,marginTop:12}}>
+            All 4 levels are now available. Chromatic swaras, advanced jumps, and three full octaves await.
+          </p>
+          <div style={{marginTop:24,display:"flex",gap:12,alignItems:"center",justifyContent:"center"}}>
+            <div style={{width:8,height:8,borderRadius:"50%",background:"#9A7B50"}}/>
+            <div style={{width:8,height:8,borderRadius:"50%",background:"#9A7B50"}}/>
+            <div style={{width:8,height:8,borderRadius:"50%",background:"#9A7B50"}}/>
+          </div>
         </div>
       )}
 
