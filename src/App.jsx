@@ -1,4 +1,4 @@
-import SwaraSlamApp from "./SwaraSlamModule03";
+import SwaraSlamApp from "./SwaraSlamModule04";
 export default function App() {
   return <SwaraSlamApp />;
 }
