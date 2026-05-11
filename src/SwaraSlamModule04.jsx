@@ -477,22 +477,39 @@ export default function SwaraSlamApp() {
     const params = new URLSearchParams(window.location.search);
     if (params.get("success") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
-      supabase.auth.getSession().then(({ data: { session } }) => {
+      // Give webhook time to process (it's async), then check premium status
+      setTimeout(async () => {
+        const { data: { session } } = await supabase.auth.getSession();
         if (session?.user) {
-          loadProfile(session.user.id).then(premium => {
-            if (premium) {
-              // Trigger confetti celebration
-              setConfetti(true);
-              setTimeout(() => setConfetti(false), 3500);
-              // Show success screen, then route to game
-              setScreen("premium-unlocked");
-              setTimeout(() => setScreen("game"), 3500);
-            }
-          });
+          const premium = await loadProfile(session.user.id);
+          if (premium) {
+            // Success! Show celebration
+            setConfetti(true);
+            setTimeout(() => setConfetti(false), 3500);
+            setScreen("premium-unlocked");
+            setTimeout(() => setScreen("game"), 3500);
+          } else {
+            // Webhook might still be processing, wait a bit more
+            console.log("Premium not yet updated, waiting...");
+            setTimeout(async () => {
+              const stillPremium = await loadProfile(session.user.id);
+              if (stillPremium) {
+                setConfetti(true);
+                setTimeout(() => setConfetti(false), 3500);
+                setScreen("premium-unlocked");
+                setTimeout(() => setScreen("game"), 3500);
+              } else {
+                // Something went wrong
+                alert("Payment received but premium status not updated. Please contact support or try logging out and back in.");
+                setScreen("paywall");
+              }
+            }, 2000);
+          }
         }
-      });
+      }, 1000); // Initial 1 second delay for webhook
     } else if (params.get("canceled") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
+      // Stay on current screen (probably paywall)
     }
 
     // Silently restore session
@@ -522,9 +539,12 @@ export default function SwaraSlamApp() {
       const sn  = Math.max(0, (data.current_set   || 1) - 1);
       const premium = data.is_premium || false;
       setLevel(lvl); setSetNum(sn);
-      setIsPremium(premium); isPremiumRef.current = premium;
+      setIsPremium(premium); 
+      isPremiumRef.current = premium; // Critical: sync ref immediately
+      userRef.current = user; // Also sync user ref
       setHighestBpm(data.last_bpm || data.highest_bpm || BASE_BPM);
       setCards(generateCards(lvl)); setCurrentCards(null);
+      console.log("loadProfile: isPremium =", premium, "for user", userId.substring(0, 8));
       return premium;
     } catch (e) { console.error("loadProfile:", e); return false; }
   };
