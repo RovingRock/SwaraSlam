@@ -35,12 +35,17 @@ function AuthModal({ onClose, onAuthSuccess }) {
             terms_accepted: true,
             terms_accepted_at: new Date().toISOString(),
           }).eq("id", data.user.id);
-          setMessage("Account created! Check your email to confirm, then log in below.");
-          setTimeout(() => setMode("login"), 3000);
+          setMessage("✅ Account created! Check your email to confirm your account before logging in.");
+          // Don't auto-switch to login — user must manually click "Log In" after confirming email
         }
       } else {
         const { data, error: err } = await supabase.auth.signInWithPassword({ email, password });
         if (err) throw err;
+        // Check if email is confirmed
+        if (data.user && !data.user.email_confirmed_at) {
+          setError("Please confirm your email address before logging in. Check your inbox for the confirmation link.");
+          return;
+        }
         if (data.user) onAuthSuccess(data.user);
       }
     } catch (err) {
@@ -116,9 +121,12 @@ function AuthModal({ onClose, onAuthSuccess }) {
   );
 }
 
-// ─── Paywall Screen ───────────────────────────────────────────────────────────
-function PaywallScreen({ onCheckout, redirecting }) {
-  const btnBase = { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"13px 24px",color:"#fff",border:"none",borderRadius:8,cursor:redirecting?"not-allowed":"pointer",opacity:redirecting?0.6:1,width:"100%" };
+// ─── Paywall Overlay ──────────────────────────────────────────────────────────
+// Shown directly (not inside the arena) when user is logged in but not premium.
+function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
+  const btnBase = { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"13px 24px",color:"#fff",border:"none",borderRadius:8,cursor:redirecting?"not-allowed":"pointer",width:"100%" };
+  const isRedirecting = (priceId) => redirecting && redirectingPriceId === priceId;
+  
   return (
     <div style={{width:"100%",maxWidth:480,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",gap:20,padding:"32px 16px"}}>
       <div style={{fontSize:44}}>🔒</div>
@@ -128,17 +136,19 @@ function PaywallScreen({ onCheckout, redirecting }) {
       <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>
         Level 1 is free. Unlock chromatic swaras, advanced jumps, and three octaves with full access.
       </p>
+
       <div style={{display:"flex",gap:16,flexWrap:"wrap",justifyContent:"center",width:"100%",marginTop:8}}>
         {/* 24-Hour Pass */}
         <div style={{background:"#fff",border:"1.5px solid #E5DFD3",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center"}}>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>24-HOUR PASS</div>
           <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:38,fontWeight:600,color:"#1C1A17",lineHeight:1,marginBottom:4}}>$1.99</div>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:"#6B6560",marginBottom:16}}>Try all levels for a day</div>
-          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpF4CevGY65XqM13lijglp")}
-            style={{...btnBase,background:"#9A7B50"}}>
-            {redirecting ? "Redirecting…" : "Get 24-Hour Access"}
+          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpDNCevGY65XqMdTh1x4Qb")}
+            style={{...btnBase,background:"#9A7B50",opacity:isRedirecting("price_1TVpDNCevGY65XqMdTh1x4Qb")?0.6:redirecting?0.3:1}}>
+            {isRedirecting("price_1TVpDNCevGY65XqMdTh1x4Qb") ? "Redirecting…" : "Get 24-Hour Access"}
           </button>
         </div>
+
         {/* Lifetime */}
         <div style={{background:"linear-gradient(135deg,rgba(192,95,47,0.08),rgba(154,123,80,0.08))",border:"2px solid #C05F2F",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center",position:"relative"}}>
           <div style={{position:"absolute",top:-12,left:"50%",transform:"translateX(-50%)",background:"#C05F2F",color:"#fff",padding:"3px 12px",borderRadius:20,fontSize:10,fontWeight:700,fontFamily:"'DM Sans',sans-serif",whiteSpace:"nowrap"}}>
@@ -147,12 +157,13 @@ function PaywallScreen({ onCheckout, redirecting }) {
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#C05F2F",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>LIFETIME ACCESS</div>
           <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:38,fontWeight:600,color:"#C05F2F",lineHeight:1,marginBottom:4}}>$9.99</div>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:"#6B6560",marginBottom:16}}>Unlock forever</div>
-          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpF0CevGY65XqMgLukQcWc")}
-            style={{...btnBase,background:"#C05F2F",boxShadow:"0 4px 12px rgba(192,95,47,0.3)"}}>
-            {redirecting ? "Redirecting…" : "✦ Get Lifetime Access"}
+          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpBKCevGY65XqMA79vW9Rt")}
+            style={{...btnBase,background:"#C05F2F",boxShadow:"0 4px 12px rgba(192,95,47,0.3)",opacity:isRedirecting("price_1TVpBKCevGY65XqMA79vW9Rt")?0.6:redirecting?0.3:1}}>
+            {isRedirecting("price_1TVpBKCevGY65XqMA79vW9Rt") ? "Redirecting…" : "✦ Get Lifetime Access"}
           </button>
         </div>
       </div>
+
       <p style={{fontFamily:"'Cormorant Garamond',serif",fontSize:16,color:"#9A7B50",opacity:0.5,margin:"8px 0 0"}}>
         स &nbsp; र &nbsp; ग &nbsp; म
       </p>
@@ -431,6 +442,7 @@ export default function SwaraSlamApp() {
   const [user,               setUser]               = useState(null);
   const [isPremium,          setIsPremium]          = useState(false);
   const [paywallRedirecting, setPaywallRedirecting] = useState(false);
+  const [redirectingPriceId, setRedirectingPriceId] = useState(null);
   const [highestBpm,         setHighestBpm]         = useState(BASE_BPM);
 
   // Walkthrough
@@ -678,6 +690,7 @@ export default function SwaraSlamApp() {
   // Stripe checkout — user is guaranteed logged in when PaywallScreen is shown
   const handleStripeCheckout = useCallback(async (priceId) => {
     setPaywallRedirecting(true);
+    setRedirectingPriceId(priceId); // Track which button was clicked
     try {
       // Always refresh first — avoids stale token 401s after auth redirects
       const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession();
@@ -689,6 +702,7 @@ export default function SwaraSlamApp() {
         if (se || !fallback?.access_token) {
           console.error("No valid session at checkout:", se);
           setPaywallRedirecting(false);
+          setRedirectingPriceId(null);
           setScreen("auth");
           return;
         }
@@ -701,6 +715,7 @@ export default function SwaraSlamApp() {
       console.error("Stripe checkout error:", err);
       alert(`Payment setup failed: ${err.message}`);
       setPaywallRedirecting(false);
+      setRedirectingPriceId(null);
     }
 
     async function doCheckout(priceId, token) {
@@ -725,6 +740,7 @@ export default function SwaraSlamApp() {
         console.error("doCheckout error:", err);
         alert(`Payment setup failed: ${err.message}`);
         setPaywallRedirecting(false);
+        setRedirectingPriceId(null);
       }
     }
   }, []);
@@ -1036,7 +1052,7 @@ export default function SwaraSlamApp() {
       {/* PAYWALL — full screen, no game behind it */}
       {screen === "paywall" && (
         <div className="screen" style={{justifyContent:"flex-start",paddingTop:32,overflowY:"auto",gap:0}}>
-          <PaywallScreen onCheckout={handleStripeCheckout} redirecting={paywallRedirecting} />
+          <PaywallScreen onCheckout={handleStripeCheckout} redirecting={paywallRedirecting} redirectingPriceId={redirectingPriceId} />
           <button className="ghost-btn" style={{marginTop:4}} onClick={() => setScreen("game")}>
             ← Back to Level 1
           </button>
