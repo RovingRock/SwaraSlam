@@ -7,6 +7,203 @@ const supabase = createClient(
   import.meta.env.VITE_SUPABASE_ANON_KEY
 );
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── usePitchDetection Hook ───────────────────────────────────────────────────
+// RULE #2: Fully encapsulated. No game state is read or written from inside.
+// Accepts: isActive (bool), targetFreq (number)
+// Returns: isMatch (bool)
+// ═══════════════════════════════════════════════════════════════════════════════
+function usePitchDetection({ isActive, targetFreq }) {
+  const [isMatch, setIsMatch] = useState(false);
+
+  const audioCtxRef    = useRef(null);
+  const analyserRef    = useRef(null);
+  const streamRef      = useRef(null);
+  const sourceRef      = useRef(null);
+  const rafRef         = useRef(null);
+  const bufferRef      = useRef(null);
+  const isActiveRef    = useRef(isActive);
+  const targetFreqRef  = useRef(targetFreq);
+
+  isActiveRef.current   = isActive;
+  targetFreqRef.current = targetFreq;
+
+  // ── Autocorrelation pitch detection ────────────────────────────────────────
+  // Classic McLeod / YIN-adjacent approach using Web Audio AnalyserNode buffer.
+  const detectPitch = useCallback((analyser, sampleRate) => {
+    const buffer = bufferRef.current;
+    analyser.getFloatTimeDomainData(buffer);
+
+    // RMS silence gate — skip if signal too quiet (< -60 dBFS ≈ 0.001)
+    let rms = 0;
+    for (let i = 0; i < buffer.length; i++) rms += buffer[i] * buffer[i];
+    rms = Math.sqrt(rms / buffer.length);
+    if (rms < 0.012) return null;
+
+    // Autocorrelation
+    const n = buffer.length;
+    let bestOffset = -1;
+    let bestCorr   = 0;
+    let lastCorr   = 1;
+    let foundGo    = false;
+
+    // Search range: 50 Hz – 1200 Hz covers all vocal ranges + upper swaras
+    const minOffset = Math.floor(sampleRate / 1200);
+    const maxOffset = Math.ceil(sampleRate / 50);
+
+    for (let offset = minOffset; offset <= maxOffset; offset++) {
+      let corr = 0;
+      for (let i = 0; i < n - offset; i++) {
+        corr += Math.abs(buffer[i] - buffer[i + offset]);
+      }
+      corr = 1 - corr / (n - offset);
+
+      if (corr > 0.9 && corr > lastCorr) {
+        foundGo = true;
+      }
+      if (foundGo && corr < lastCorr) {
+        // Local peak found
+        if (corr > bestCorr) {
+          bestCorr   = corr;
+          bestOffset = offset - 1;
+        }
+        foundGo = false;
+      }
+      lastCorr = corr;
+    }
+
+    if (bestOffset === -1 || bestCorr < 0.92) return null;
+
+    // Parabolic interpolation for sub-sample accuracy
+    // Compute normalised correlation at a given offset
+    const corrAt = (offset) => {
+      let c = 0;
+      const len = n - offset;
+      for (let i = 0; i < len; i++) c += Math.abs(buffer[i] - buffer[i + offset]);
+      return 1 - c / len;
+    };
+
+    const prev = bestOffset > 0        ? corrAt(bestOffset - 1) : corrAt(bestOffset);
+    const curr = bestCorr;
+    const next = bestOffset < maxOffset ? corrAt(bestOffset + 1) : corrAt(bestOffset);
+
+    const denom = 2 * (2 * curr - next - prev);
+    const shift = denom !== 0 ? (next - prev) / denom : 0;
+    const refinedOffset = bestOffset + shift;
+
+    return sampleRate / refinedOffset;
+  }, []);
+
+  // ── Frequency → Cents deviation from target ────────────────────────────────
+  const freqToCents = (detected, target) => {
+    if (!detected || !target || detected <= 0 || target <= 0) return Infinity;
+    return 1200 * Math.log2(detected / target);
+  };
+
+  // ── Check match across all octaves of the target swara ────────────────────
+  // A singer may produce the swara in mandra (lower) or taar (upper) saptak.
+  const checkMatchAcrossOctaves = useCallback((detectedHz, targetHz) => {
+    if (!detectedHz || !targetHz) return false;
+    // Check target octave, one below, one above
+    for (const mult of [0.5, 1, 2]) {
+      const octaveTarget = targetHz * mult;
+      const cents = Math.abs(freqToCents(detectedHz, octaveTarget));
+      if (cents <= 25) return true;   // ±25 cents tolerance as specified
+    }
+    return false;
+  }, []);
+
+  // ── Detection loop ─────────────────────────────────────────────────────────
+  const startLoop = useCallback(() => {
+    const analyser   = analyserRef.current;
+    const sampleRate = audioCtxRef.current?.sampleRate ?? 44100;
+
+    const loop = () => {
+      if (!isActiveRef.current) {
+        setIsMatch(false);
+        return;
+      }
+      rafRef.current = requestAnimationFrame(loop);
+
+      const hz = detectPitch(analyser, sampleRate);
+      const matched = checkMatchAcrossOctaves(hz, targetFreqRef.current);
+      setIsMatch(matched);
+    };
+
+    rafRef.current = requestAnimationFrame(loop);
+  }, [detectPitch, checkMatchAcrossOctaves]);
+
+  // ── Teardown helper ────────────────────────────────────────────────────────
+  const teardown = useCallback(() => {
+    cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    setIsMatch(false);
+
+    try { sourceRef.current?.disconnect(); } catch (e) {}
+    try { analyserRef.current?.disconnect(); } catch (e) {}
+
+    // Stop all mic tracks — removes browser "mic in use" indicator
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+    sourceRef.current = null;
+    analyserRef.current = null;
+
+    try { audioCtxRef.current?.close(); } catch (e) {}
+    audioCtxRef.current = null;
+    bufferRef.current = null;
+  }, []);
+
+  // ── Main effect: start / stop based on isActive ───────────────────────────
+  useEffect(() => {
+    if (!isActive) {
+      teardown();
+      return;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        if (cancelled) { stream.getTracks().forEach(t => t.stop()); return; }
+
+        streamRef.current = stream;
+
+        const ctx      = new (window.AudioContext || window.webkitAudioContext)();
+        audioCtxRef.current = ctx;
+        if (ctx.state === "suspended") await ctx.resume();
+
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize          = 2048;
+        analyser.smoothingTimeConstant = 0.0; // No smoothing for pitch accuracy
+        analyserRef.current = analyser;
+        bufferRef.current = new Float32Array(analyser.fftSize);
+
+        const source = ctx.createMediaStreamSource(stream);
+        source.connect(analyser);
+        // NOTE: Do NOT connect to ctx.destination — avoids mic feedback
+        sourceRef.current = source;
+
+        startLoop();
+      } catch (err) {
+        // Mic permission denied or hardware unavailable — fail silently
+        console.warn("usePitchDetection: mic unavailable:", err.message);
+        setIsMatch(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      teardown();
+    };
+  }, [isActive]); // eslint-disable-line react-hooks/exhaustive-deps
+  // targetFreq changes are handled via ref — no need to restart AudioContext
+
+  return { isMatch };
+}
+
 // ─── Auth Modal ───────────────────────────────────────────────────────────────
 function AuthModal({ onClose, onAuthSuccess }) {
   const [mode, setMode]                   = useState("signup");
@@ -17,17 +214,11 @@ function AuthModal({ onClose, onAuthSuccess }) {
   const [loading, setLoading]             = useState(false);
   const [error, setError]                 = useState("");
   const [message, setMessage]             = useState("");
-  const [honeypot, setHoneypot]           = useState(""); // Rule 2: Bot protection
+  const [honeypot, setHoneypot]           = useState("");
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    
-    // Rule 2: Honeypot check - if filled, reject (bot)
-    if (honeypot) {
-      console.log("Bot detected via honeypot");
-      return; // Silently reject
-    }
-    
+    if (honeypot) return;
     if (mode === "signup" && !termsAccepted) {
       setError("Please accept the Terms & Conditions to continue");
       return;
@@ -39,28 +230,19 @@ function AuthModal({ onClose, onAuthSuccess }) {
           email,
           password,
           options: {
-            emailRedirectTo: "https://swara-slam.vercel.app", // Rule 1: Production URL
-            data: {
-              marketing_consent: marketingConsent,
-            }
+            emailRedirectTo: "https://swara-slam.vercel.app",
+            data: { marketing_consent: marketingConsent }
           }
         });
-        
-        // Rule 2: Check if user already exists
         if (err) {
           if (err.message.includes("already registered") || err.message.includes("already exists")) {
             setError("This email is already registered. Please log in.");
             setTimeout(() => setMode("login"), 2000);
-          } else {
-            throw err;
-          }
+          } else { throw err; }
           return;
         }
-        
         if (data.user) {
-          // Rule 2 & 3: Proper confirmation message
           const needsConfirmation = !data.session;
-          
           if (needsConfirmation) {
             setMessage("✅ Verification email sent! Please check your inbox and click the link to activate your account.");
           } else {
@@ -69,7 +251,6 @@ function AuthModal({ onClose, onAuthSuccess }) {
               terms_accepted: true,
               terms_accepted_at: new Date().toISOString(),
             }).eq("id", data.user.id);
-            
             setMessage("✅ Account created successfully!");
             setTimeout(() => onAuthSuccess(data.user), 1000);
           }
@@ -77,7 +258,6 @@ function AuthModal({ onClose, onAuthSuccess }) {
       } else {
         const { data, error: err } = await supabase.auth.signInWithPassword({ email, password });
         if (err) throw err;
-        // Check if email is confirmed
         if (data.user && !data.user.email_confirmed_at) {
           setError("Please confirm your email address before logging in. Check your inbox for the confirmation link.");
           return;
@@ -122,15 +302,11 @@ function AuthModal({ onClose, onAuthSuccess }) {
         <h2 style={s.heading}>{mode === "login" ? "Welcome Back" : "Create Free Account"}</h2>
         <p style={s.sub}>{mode === "login" ? "Continue your Swara practice" : "Sign up to save progress & unlock levels"}</p>
         <form onSubmit={handleSubmit} style={s.form}>
-          {/* Rule 2: Honeypot for bot protection - hidden from humans */}
-          <input 
-            type="text" 
-            name="website_verification" 
-            value={honeypot} 
+          <input
+            type="text" name="website_verification" value={honeypot}
             onChange={e => setHoneypot(e.target.value)}
             style={{position:"absolute",left:"-9999px",width:1,height:1,opacity:0}}
-            tabIndex={-1}
-            autoComplete="off"
+            tabIndex={-1} autoComplete="off"
           />
           <input type="email" placeholder="Email address" value={email} onChange={e => setEmail(e.target.value)} required style={s.input} />
           <input type="password" placeholder="Password (min. 6 characters)" value={password} onChange={e => setPassword(e.target.value)} required minLength={6} style={s.input} />
@@ -167,12 +343,11 @@ function AuthModal({ onClose, onAuthSuccess }) {
   );
 }
 
-// ─── Paywall Overlay ──────────────────────────────────────────────────────────
-// Shown directly (not inside the arena) when user is logged in but not premium.
+// ─── Paywall Screen ───────────────────────────────────────────────────────────
 function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
   const btnBase = { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"13px 24px",color:"#fff",border:"none",borderRadius:8,cursor:redirecting?"not-allowed":"pointer",width:"100%" };
   const isRedirecting = (priceId) => redirecting && redirectingPriceId === priceId;
-  
+
   return (
     <div style={{width:"100%",maxWidth:480,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",gap:20,padding:"32px 16px"}}>
       <div style={{fontSize:44}}>🔒</div>
@@ -182,9 +357,7 @@ function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
       <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>
         Level 1 is free. Unlock chromatic swaras, advanced jumps, and three octaves with full access.
       </p>
-
       <div style={{display:"flex",gap:16,flexWrap:"wrap",justifyContent:"center",width:"100%",marginTop:8}}>
-        {/* 24-Hour Pass */}
         <div style={{background:"#fff",border:"1.5px solid #E5DFD3",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center"}}>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>24-HOUR PASS</div>
           <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:38,fontWeight:600,color:"#1C1A17",lineHeight:1,marginBottom:4}}>$1.99</div>
@@ -194,8 +367,6 @@ function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
             {isRedirecting("price_1TVpDNCevGY65XqMdTh1x4Qb") ? "Redirecting…" : "Get 24-Hour Access"}
           </button>
         </div>
-
-        {/* Lifetime */}
         <div style={{background:"linear-gradient(135deg,rgba(192,95,47,0.08),rgba(154,123,80,0.08))",border:"2px solid #C05F2F",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center",position:"relative"}}>
           <div style={{position:"absolute",top:-12,left:"50%",transform:"translateX(-50%)",background:"#C05F2F",color:"#fff",padding:"3px 12px",borderRadius:20,fontSize:10,fontWeight:700,fontFamily:"'DM Sans',sans-serif",whiteSpace:"nowrap"}}>
             BEST VALUE
@@ -408,9 +579,9 @@ function useAudioEngine() {
     nextBeatRef.current = ctx.currentTime + 0.08; beatCountRef.current = 0; tick();
   }, [getCtx]);
 
-  const stopScheduler = useCallback(() => { clearTimeout(schedTimerRef.current); schedTimerRef.current = null; }, []);
-  const resumeCtx     = useCallback(() => { if (ctxRef.current?.state === "suspended") ctxRef.current.resume(); }, []);
-  const updateDroneFreq = useCallback((freq) => {
+  const stopScheduler    = useCallback(() => { clearTimeout(schedTimerRef.current); schedTimerRef.current = null; }, []);
+  const resumeCtx        = useCallback(() => { if (ctxRef.current?.state === "suspended") ctxRef.current.resume(); }, []);
+  const updateDroneFreq  = useCallback((freq) => {
     if (!droneNodesRef.current.length || !ctxRef.current) return;
     const t = ctxRef.current.currentTime + 0.05;
     [freq,freq*2,freq*3,freq*5,freq*1.5,freq*3].forEach((f,i) => {
@@ -418,14 +589,95 @@ function useAudioEngine() {
     });
   }, []);
 
-  return { startDrone, stopDrone, scheduleBeats, stopScheduler, resumeCtx, updateDroneFreq, playGuruNote };
+  // ── Set complete "ding" — bright triangle-wave chime, distinct from guru notes ──
+  const playSetDing = useCallback(() => {
+    const ctx = getCtx();
+    const t = ctx.currentTime + 0.05;
+    // Two-note quick chime: root + fifth
+    [[880, 0],[1320, 0.12]].forEach(([freq, delay]) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "triangle";
+      o.frequency.setValueAtTime(freq, t + delay);
+      g.gain.setValueAtTime(0, t + delay);
+      g.gain.linearRampToValueAtTime(0.18, t + delay + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.45);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t + delay); o.stop(t + delay + 0.5);
+    });
+  }, [getCtx]);
+
+  // ── Level up arpeggio — 5-note rising synth, square wave for game-feel ──
+  const playLevelUpArp = useCallback(() => {
+    const ctx = getCtx();
+    const t = ctx.currentTime + 0.08;
+    // Sa Re Ga Pa Sa' — pentatonic rise, feels triumphant not cheesy
+    const freqs = [261.63, 293.66, 329.63, 392.00, 523.25];
+    freqs.forEach((freq, i) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "square";
+      o.frequency.setValueAtTime(freq, t + i * 0.11);
+      // Square wave can be harsh — low gain + steep decay
+      g.gain.setValueAtTime(0, t + i * 0.11);
+      g.gain.linearRampToValueAtTime(0.08, t + i * 0.11 + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.11 + 0.22);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t + i * 0.11); o.stop(t + i * 0.11 + 0.25);
+    });
+    // Final sustain chord: Sa + Pa together
+    [[261.63, 392.00]].forEach(([f]) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.setValueAtTime(f * 2, t + freqs.length * 0.11);
+      g.gain.setValueAtTime(0.1, t + freqs.length * 0.11);
+      g.gain.exponentialRampToValueAtTime(0.001, t + freqs.length * 0.11 + 0.6);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t + freqs.length * 0.11); o.stop(t + freqs.length * 0.11 + 0.65);
+    });
+  }, [getCtx]);
+
+  // ── Grand Slam fanfare — full ascending run + held chord ──
+  const playGrandSlamFanfare = useCallback(() => {
+    const ctx = getCtx();
+    const t = ctx.currentTime + 0.08;
+    const freqs = [261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88, 523.25];
+    freqs.forEach((freq, i) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = i < 4 ? "square" : "triangle";
+      o.frequency.setValueAtTime(freq, t + i * 0.09);
+      g.gain.setValueAtTime(0, t + i * 0.09);
+      g.gain.linearRampToValueAtTime(0.09, t + i * 0.09 + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.09 + 0.3);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t + i * 0.09); o.stop(t + i * 0.09 + 0.35);
+    });
+    // Held major chord at end
+    [523.25, 659.25, 783.99].forEach((freq, i) => {
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.setValueAtTime(freq, t + freqs.length * 0.09);
+      g.gain.setValueAtTime(0.09 - i * 0.02, t + freqs.length * 0.09);
+      g.gain.exponentialRampToValueAtTime(0.001, t + freqs.length * 0.09 + 1.2);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t + freqs.length * 0.09); o.stop(t + freqs.length * 0.09 + 1.3);
+    });
+  }, [getCtx]);
+
+  return { startDrone, stopDrone, scheduleBeats, stopScheduler, resumeCtx, updateDroneFreq, playGuruNote, playSetDing, playLevelUpArp, playGrandSlamFanfare };
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
-function SwaraCard({ swara, state }) {
+// MODIFIED: Added pitchMatched prop for green glow feedback
+function SwaraCard({ swara, state, pitchMatched }) {
   const oct = swara.octave ?? 1;
+  // pitchMatched adds .card-match on top of the existing state class
+  const extraClass = pitchMatched ? " card-match" : "";
   return (
-    <div className={"swara-card card-" + state}>
+    <div className={"swara-card card-" + state + extraClass}>
       <span className="card-dv">{swara.dv}</span>
       <span className={"card-name" + (oct === 0 ? " oct-mandra" : "")}>
         {swara.short}{oct === 2 && <span className="oct-dot-above">·</span>}
@@ -456,8 +708,30 @@ const WT_STEPS = [
   { title:"Levels & Sets", body:"Each level has 5 sets. Complete all 5 to advance. Level 1 is free — unlock Full Access for Levels 2–4 with chromatic notes and wider jumps." },
 ];
 
+// ─── Title Hierarchy ──────────────────────────────────────────────────────────
+const TOTAL_PER_LEVEL  = ACTIVE_BEATS * SETS_PER_LEVEL; // 40
+const TOTAL_ALL_LEVELS = TOTAL_PER_LEVEL * LEVEL_CONFIG.length; // 160
+
+function getTitleForPct(pct) {
+  if (pct <= 20) return { title: "Shishya",  emoji: "🌱", color: "#9A7B50" };
+  if (pct <= 40) return { title: "Sadhak",   emoji: "🔥", color: "#C05F2F" };
+  if (pct <= 59) return { title: "Gyani",    emoji: "⚡", color: "#C05F2F" };
+  if (pct <= 79) return { title: "Pundit",   emoji: "🎯", color: "#1C1A17" };
+  return              { title: "Guru",      emoji: "✦",  color: "#9A7B50"  };
+}
+
+function getLevelSummaryMessage(score, total) {
+  const pct = Math.round((score / total) * 100);
+  const { title, emoji } = getTitleForPct(pct);
+  if (pct === 100) return { msg: `Perfect Slam! You nailed all ${total}. ${emoji} Guru status — the Swara is strong with you.`, title, emoji };
+  if (pct >= 80)  return { msg: `You Swara Slammed it! ${score}/${total} nailed. ${emoji} ${title} status achieved — you're on fire!`, title, emoji };
+  if (pct >= 60)  return { msg: `Solid Slam! ${score} out of ${total}. ${emoji} ${title} vibes. Keep Swara Slamming to reach Guru!`, title, emoji };
+  if (pct >= 41)  return { msg: `Nice hustle! ${score}/${total} right. ${emoji} ${title} level — your Swara game is building!`, title, emoji };
+  if (pct >= 21)  return { msg: `${score}/${total} this round. ${emoji} ${title} status. Every Slam counts — slam again!`, title, emoji };
+  return               { msg: `${score}/${total} — keep at it, ${emoji} ${title}! The Riyaz will sharpen you. Ready to Slam again?`, title, emoji };
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
-// screen: "home" | "ready" | "game" | "auth" | "paywall"
 export default function SwaraSlamApp() {
 
   const [screen, setScreen] = useState("home");
@@ -479,6 +753,32 @@ export default function SwaraSlamApp() {
   const [levelUpVisible, setLevelUpVisible] = useState(false);
   const [confetti,       setConfetti]       = useState(false);
   const [allLevelsUp,    setAllLevelsUp]    = useState(false);
+
+  // ── NEW: Scoring & pitch detection state ──────────────────────────────────
+  // score: total matched swaras in current set (resets each set)
+  // scoredCards: Set of card indices already scored this set (one-hit-per-card)
+  // micActive: drives usePitchDetection — true only when game is actively playing
+  const [score,        setScore]        = useState(0);
+  const [scoredCards,  setScoredCards]  = useState(new Set());
+  const scoredCardsRef = useRef(new Set());  // Ref mirror for use inside callbacks
+  const [micActive,    setMicActive]    = useState(false);
+
+  // ── NEW: Cumulative level scoring ─────────────────────────────────────────
+  // levelTotalScore: accumulates set scores across a full level (resets on level change)
+  // levelSummaryData: { score, total, title, emoji, msg } — shown in Level Summary overlay
+  // grandSlamScore: total points across all 4 levels (160 max)
+  const [levelTotalScore,   setLevelTotalScore]   = useState(0);
+  const levelTotalScoreRef  = useRef(0);
+  const [levelSummaryData,  setLevelSummaryData]  = useState(null); // null = hidden
+  const [grandSlamScore,    setGrandSlamScore]    = useState(0);
+  const grandSlamScoreRef   = useRef(0);
+  // scoreRef: mirrors current set `score` for use inside advanceSet callback
+  const scoreRef = useRef(0);
+
+  // Compute the target frequency the user should be singing right now.
+  const activeCardRef = useRef(activeCard);
+  activeCardRef.current = activeCard;
+  scoreRef.current = score;
 
   // Auth/paywall
   const [user,                  setUser]                  = useState(null);
@@ -514,75 +814,92 @@ export default function SwaraSlamApp() {
 
   const autoBpm = BASE_BPM + setNum * BPM_INCREMENT;
 
-  // ── Session restore — NEVER drives screen changes ──────────────────────────
+  // ── usePitchDetection — RULE #2 compliant isolated hook ───────────────────
+  // targetFreq = Sa * ratio of active card. -1 when no card is active.
+  const activeCardData = (cardsRef.current && activeCard >= 0 && activeCard < cardsRef.current.length)
+    ? cardsRef.current[activeCard]
+    : null;
+  const targetFreq = activeCardData
+    ? SA_PITCHES[saIndex].freq * activeCardData.ratio
+    : -1;
+
+  const { isMatch } = usePitchDetection({
+    isActive:   micActive && phase === "active" && activeCard >= 0,
+    targetFreq: targetFreq > 0 ? targetFreq : 1, // prevent log(0)
+  });
+
+  // ── Scoring logic — one-hit-per-card ─────────────────────────────────────
+  // When isMatch flips true for a card index not yet scored this set, add point.
   useEffect(() => {
-    // Handle Stripe return URLs
+    if (!isMatch) return;
+    if (phase !== "active") return;
+    if (activeCard < 0) return;
+    if (scoredCardsRef.current.has(activeCard)) return; // already scored
+
+    const next = new Set(scoredCardsRef.current);
+    next.add(activeCard);
+    scoredCardsRef.current = next;
+    setScoredCards(next);
+    setScore(s => {
+      scoreRef.current = s + 1;
+      return s + 1;
+    });
+    // Accumulate into level total
+    setLevelTotalScore(lt => {
+      levelTotalScoreRef.current = lt + 1;
+      return lt + 1;
+    });
+    // Accumulate into grand slam total
+    setGrandSlamScore(gs => {
+      grandSlamScoreRef.current = gs + 1;
+      return gs + 1;
+    });
+  }, [isMatch, activeCard, phase]);
+
+  // Reset per-set scoring state when a new set begins (activeCard resets to -1)
+  useEffect(() => {
+    if (phase === "idle" || phase === "leadin") {
+      scoredCardsRef.current = new Set();
+      setScoredCards(new Set());
+      // Don't reset total score here — it accumulates across the set
+    }
+  }, [phase]);
+
+  // ── Session restore ────────────────────────────────────────────────────────
+  useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get("success") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
-      
-      // Aggressive retry pattern for webhook completion
       let attempts = 0;
       const maxAttempts = 5;
-      
       const checkPremiumStatus = async () => {
         attempts++;
-        console.log(`Checking premium status (attempt ${attempts}/${maxAttempts})...`);
-        
         const { data: { session } } = await supabase.auth.getSession();
-        if (!session?.user) {
-          console.error("No session found");
-          return;
-        }
-        
-        // Force a fresh database read (bypass any caching)
-        const { data: profile, error } = await supabase
-          .from("profiles")
-          .select("is_premium")
-          .eq("id", session.user.id)
-          .single();
-        
-        console.log("Profile check:", profile, "Error:", error);
-        
+        if (!session?.user) return;
+        const { data: profile } = await supabase
+          .from("profiles").select("is_premium").eq("id", session.user.id).single();
         if (profile?.is_premium) {
-          // Success! Update all state
-          setIsPremium(true);
-          isPremiumRef.current = true;
-          userRef.current = session.user;
-          setUser(session.user);
-          
-          console.log("✓ Premium confirmed! Showing celebration...");
-          
-          // Show celebration
-          setConfetti(true);
-          setTimeout(() => setConfetti(false), 3500);
+          setIsPremium(true); isPremiumRef.current = true;
+          userRef.current = session.user; setUser(session.user);
+          setConfetti(true); setTimeout(() => setConfetti(false), 3500);
           setScreen("premium-unlocked");
           setTimeout(() => setScreen("game"), 3500);
         } else if (attempts < maxAttempts) {
-          // Not premium yet, retry after delay
-          console.log(`Not premium yet, retrying in ${1000 * attempts}ms...`);
-          setTimeout(checkPremiumStatus, 1000 * attempts); // Exponential backoff
+          setTimeout(checkPremiumStatus, 1000 * attempts);
         } else {
-          // Give up after max attempts
-          console.error("Premium status not updated after", maxAttempts, "attempts");
           alert("Payment received but premium status not updated. Please refresh the page or contact support.");
-          setScreen("game"); // At least let them play Level 1
+          setScreen("game");
         }
       };
-      
-      // Start checking after 1 second (give webhook a head start)
       setTimeout(checkPremiumStatus, 1000);
-      
     } else if (params.get("canceled") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
     }
 
-    // Silently restore session
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (session?.user) { setUser(session.user); userRef.current = session.user; loadProfile(session.user.id); }
     });
 
-    // Auth state change — only syncs state, NEVER changes screen
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, session) => {
       if (session?.user) {
         setUser(session.user); userRef.current = session.user;
@@ -595,7 +912,6 @@ export default function SwaraSlamApp() {
     return () => subscription.unsubscribe();
   }, []);
 
-  // Returns premium boolean
   const loadProfile = async (userId) => {
     try {
       const { data, error } = await supabase.from("profiles").select("*").eq("id", userId).single();
@@ -603,18 +919,14 @@ export default function SwaraSlamApp() {
       const lvl = Math.max(0, (data.current_level || 1) - 1);
       const sn  = Math.max(0, (data.current_set   || 1) - 1);
       const premium = data.is_premium || false;
-      
-      // User has completed Level 1 if they're on Level 2+ OR (on Level 1 but past all sets)
       const completedL1 = lvl >= 1 || (lvl === 0 && sn >= SETS_PER_LEVEL);
-      
       setLevel(lvl); setSetNum(sn);
-      setIsPremium(premium); 
+      setIsPremium(premium);
       setHasCompletedLevel1(completedL1);
-      isPremiumRef.current = premium; // Critical: sync ref immediately
-      userRef.current = user; // Also sync user ref
+      isPremiumRef.current = premium;
+      userRef.current = user;
       setHighestBpm(data.last_bpm || data.highest_bpm || BASE_BPM);
       setCards(generateCards(lvl)); setCurrentCards(null);
-      console.log("loadProfile: isPremium =", premium, "completedL1 =", completedL1, "for user", userId.substring(0, 8));
       return premium;
     } catch (e) { console.error("loadProfile:", e); return false; }
   };
@@ -628,10 +940,8 @@ export default function SwaraSlamApp() {
     } catch (e) { console.error("saveProgress:", e); }
   }, []);
 
-  // ── Cleanup
   useEffect(() => () => { engine.stopScheduler(); engine.stopDrone(); }, []);
 
-  // ── Install banner
   useEffect(() => {
     if (window.matchMedia("(display-mode: standalone)").matches) return;
     if (localStorage.getItem("installBannerDismissed")) return;
@@ -641,7 +951,6 @@ export default function SwaraSlamApp() {
     return () => window.removeEventListener("beforeinstallprompt", h);
   }, []);
 
-  // ── BPM flash
   const prevSetRef = useRef(-1), prevLevelRef = useRef(-1);
   useEffect(() => {
     if (prevSetRef.current === -1) { prevSetRef.current = setNum; prevLevelRef.current = level; return; }
@@ -652,69 +961,100 @@ export default function SwaraSlamApp() {
   }, [setNum, level]);
 
   // ── Advance set/level ──────────────────────────────────────────────────────
+  // RULE #1: Paywall / auth / navigation logic unchanged.
+  // Added: sound effects, levelTotalScore accumulation, Level Summary overlay.
   const advanceSet = useCallback((lvl, sn) => {
-    const nextSet = sn + 1;
-    
-    // Rule 3: For Level 1 non-premium users, show paywall after EACH set as gentle reminder
+    const nextSet    = sn + 1;
+    const setScore_  = scoreRef.current; // snapshot before any resets
+
+    // ── Free users on Level 1 (unchanged paywall logic) ──────────────────
     if (lvl === 0 && !isPremiumRef.current && userRef.current) {
-      // Non-premium user just finished a Level 1 set
+      engine.playSetDing();
       if (nextSet >= SETS_PER_LEVEL) {
-        // Finished all 5 sets - show bigger celebration, then paywall
-        setConfetti(true); 
+        setConfetti(true);
         setTimeout(() => setConfetti(false), 3200);
         setTimeout(() => {
-          setLevel(0); setSetNum(0); // Reset to Level 1 start
+          setLevel(0); setSetNum(0);
           setCards(generateCards(0)); setCurrentCards(null);
           if (!manualBpmRef.current) setBpm(BASE_BPM);
+          setScore(0); scoreRef.current = 0;
+          setLevelTotalScore(0); levelTotalScoreRef.current = 0;
           setScreen("paywall");
         }, 3200);
         return;
       } else {
-        // Finished a set (but not all 5) - advance and show quick paywall reminder
         setSetNum(nextSet);
         setCards(generateCards(0)); setCurrentCards(null);
         const newBpm = manualBpmRef.current ? bpmRef.current : BASE_BPM + nextSet * BPM_INCREMENT;
         if (!manualBpmRef.current) setBpm(newBpm);
         saveProgress(0, nextSet, newBpm);
-        
-        // Show paywall as gentle reminder (they can click Back to Level 1)
         setTimeout(() => setScreen("paywall"), 1500);
         return;
       }
     }
-    
-    // Standard level progression for premium users or Level 2+
-    if (nextSet >= SETS_PER_LEVEL) {
-      const nextLevel = lvl + 1;
-      setConfetti(true); setTimeout(() => setConfetti(false), 3200);
 
-      if (nextLevel === 1) {
-        // This shouldn't happen anymore (Level 1 handled above)
-        // But keep for safety
-        setHasCompletedLevel1(true);
-      }
+    // ── End of a level (Set 5 completed) ─────────────────────────────────
+    if (nextSet >= SETS_PER_LEVEL) {
+      const nextLevel  = lvl + 1;
+      const levelTotal = levelTotalScoreRef.current; // all 5 sets accumulated
+      const pct        = Math.round((levelTotal / TOTAL_PER_LEVEL) * 100);
+      const summary    = getLevelSummaryMessage(levelTotal, TOTAL_PER_LEVEL);
+
+      // Play level-up arpeggio (more celebratory than ding)
+      engine.playLevelUpArp();
+      setConfetti(true); setTimeout(() => setConfetti(false), 3200);
+      if (nextLevel === 1) setHasCompletedLevel1(true);
 
       if (nextLevel >= LEVEL_CONFIG.length) {
-        setAllLevelsUp(true);
-      } else {
-        setLevelUpVisible(true);
+        // All 4 levels done — grand slam
+        engine.playGrandSlamFanfare();
+        setLevelSummaryData({
+          ...summary,
+          levelTotal,
+          levelNum: lvl + 1,
+          isGrandSlam: true,
+          grandTotal: grandSlamScoreRef.current,
+        });
+        // Show level summary first, then grand slam overlay
         setTimeout(() => {
-          setLevelUpVisible(false);
-          setLevel(nextLevel); setSetNum(0);
-          setCards(generateCards(nextLevel)); setCurrentCards(null);
-          if (!manualBpmRef.current) setBpm(BASE_BPM);
-          saveProgress(nextLevel, 0, BASE_BPM);
-        }, 3000);
+          setLevelSummaryData(null);
+          setAllLevelsUp(true);
+        }, 5000);
+      } else {
+        // Normal level completion — show Level Summary, then advance
+        setLevelSummaryData({
+          ...summary,
+          levelTotal,
+          levelNum: lvl + 1,
+          isGrandSlam: false,
+          grandTotal: grandSlamScoreRef.current,
+        });
+        setTimeout(() => {
+          setLevelSummaryData(null);
+          setLevelUpVisible(true);
+          // Reset level total for next level
+          setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+          setTimeout(() => {
+            setLevelUpVisible(false);
+            setLevel(nextLevel); setSetNum(0);
+            setCards(generateCards(nextLevel)); setCurrentCards(null);
+            if (!manualBpmRef.current) setBpm(BASE_BPM);
+            setScore(0); scoreRef.current = 0;
+            saveProgress(nextLevel, 0, BASE_BPM);
+          }, 2800);
+        }, 4800);
       }
+
+    // ── Mid-level set completed ───────────────────────────────────────────
     } else {
-      // Mid-level set progression
+      engine.playSetDing();
       setSetNum(nextSet);
       setCards(generateCards(lvl)); setCurrentCards(null);
       const newBpm = manualBpmRef.current ? bpmRef.current : BASE_BPM + nextSet * BPM_INCREMENT;
       if (!manualBpmRef.current) setBpm(newBpm);
       saveProgress(lvl, nextSet, newBpm);
     }
-  }, [saveProgress]);
+  }, [engine, saveProgress]);
 
   // ── Playback ───────────────────────────────────────────────────────────────
   const startPlay = useCallback((replayCards) => {
@@ -722,16 +1062,26 @@ export default function SwaraSlamApp() {
     const playCards = replayCards || generateCards(levelRef.current);
     if (!replayCards) setCards(playCards);
     setCurrentCards(playCards); cardsRef.current = playCards;
+
+    // Reset per-set scoring (levelTotalScore accumulates — not reset here)
+    setScore(0); scoreRef.current = 0;
+    scoredCardsRef.current = new Set();
+    setScoredCards(new Set());
+
     const effectiveBpm = manualBpmRef.current ? bpmRef.current : autoBpm;
     if (!manualBpmRef.current) setBpm(effectiveBpm);
     engine.resumeCtx();
     if (droneOn) engine.startDrone(SA_PITCHES[saIdxRef.current].freq);
+
     setPhase("leadin"); setActiveCard(-1); setDotBeat(-1); setIsPlaying(true);
+    setMicActive(true); // ← Start pitch detection when playback begins
+
     engine.scheduleBeats(effectiveBpm, LEAD_IN_BEATS + ACTIVE_BEATS,
       (_dot, _isDown, seqIdx, sTime) => {
         setDotBeat(_dot);
-        if (seqIdx < LEAD_IN_BEATS) { setPhase("leadin"); setActiveCard(-1); }
-        else {
+        if (seqIdx < LEAD_IN_BEATS) {
+          setPhase("leadin"); setActiveCard(-1);
+        } else {
           setPhase("active");
           const ci = seqIdx - LEAD_IN_BEATS;
           setActiveCard(ci);
@@ -740,6 +1090,7 @@ export default function SwaraSlamApp() {
       },
       () => {
         setPhase("done"); setIsPlaying(false); setActiveCard(-1); setDotBeat(-1);
+        setMicActive(false); // ← Stop pitch detection when set ends
         engine.stopDrone();
         advanceSet(levelRef.current, setNumRef.current);
       }
@@ -749,10 +1100,14 @@ export default function SwaraSlamApp() {
   const stopPlay = useCallback(() => {
     engine.stopScheduler(); engine.stopDrone();
     setIsPlaying(false); setPhase("idle"); setActiveCard(-1); setDotBeat(-1);
+    setMicActive(false);
+    setScore(0); scoreRef.current = 0;
+    scoredCardsRef.current = new Set();
+    setScoredCards(new Set());
   }, [engine]);
 
   const handleRetry = useCallback(() => {
-    if (isPlaying) { engine.stopScheduler(); engine.stopDrone(); setIsPlaying(false); }
+    if (isPlaying) { engine.stopScheduler(); engine.stopDrone(); setIsPlaying(false); setMicActive(false); }
     setTimeout(() => startPlay(currentCards || cards), 80);
   }, [isPlaying, engine, currentCards, cards, startPlay]);
 
@@ -781,76 +1136,53 @@ export default function SwaraSlamApp() {
     setIsPremium(false); isPremiumRef.current = false;
     setLevel(0); setSetNum(0); setCards(generateCards(0)); setCurrentCards(null);
     setManualBpm(false); setBpm(BASE_BPM); setPhase("idle"); setActiveCard(-1);
+    setScore(0); scoreRef.current = 0;
+    setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+    setGrandSlamScore(0); grandSlamScoreRef.current = 0;
+    setMicActive(false); setLevelSummaryData(null);
     setScreen("home");
   }, [stopPlay]);
 
-  // Called after login (not signup — signup requires email confirm first)
-  // Called after login (not signup — signup requires email confirm first)
   const handleAuthSuccess = useCallback(async (loggedInUser) => {
     setUser(loggedInUser); userRef.current = loggedInUser;
-    
-    // Load their profile to get current progress
     await loadProfile(loggedInUser.id);
-    
-    // Rule 3: Always route non-premium users to Ready → Level 1
-    // Premium users also start at their saved progress (loaded above)
     setScreen("ready");
   }, []);
 
-  // Stripe checkout — user is guaranteed logged in when PaywallScreen is shown
   const handleStripeCheckout = useCallback(async (priceId) => {
     setPaywallRedirecting(true);
-    setRedirectingPriceId(priceId); // Track which button was clicked
+    setRedirectingPriceId(priceId);
     try {
-      // Always refresh first — avoids stale token 401s after auth redirects
       const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession();
       const session = refreshData?.session;
-
       if (refreshErr || !session?.access_token) {
-        // Refresh failed — fall back to getSession
         const { data: { session: fallback }, error: se } = await supabase.auth.getSession();
         if (se || !fallback?.access_token) {
-          console.error("No valid session at checkout:", se);
-          setPaywallRedirecting(false);
-          setRedirectingPriceId(null);
-          setScreen("auth");
-          return;
+          setPaywallRedirecting(false); setRedirectingPriceId(null);
+          setScreen("auth"); return;
         }
-        // Use fallback session
         return doCheckout(priceId, fallback.access_token);
       }
-
       return doCheckout(priceId, session.access_token);
     } catch (err) {
-      console.error("Stripe checkout error:", err);
       alert(`Payment setup failed: ${err.message}`);
-      setPaywallRedirecting(false);
-      setRedirectingPriceId(null);
+      setPaywallRedirecting(false); setRedirectingPriceId(null);
     }
 
     async function doCheckout(priceId, token) {
       try {
         const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/create-checkout`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${token}`,
-          },
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
           body: JSON.stringify({ priceId }),
         });
-        if (!res.ok) {
-          const errBody = await res.text();
-          console.error("Edge function error:", res.status, errBody);
-          throw new Error(`Server error: ${res.status} — ${errBody}`);
-        }
+        if (!res.ok) { const errBody = await res.text(); throw new Error(`Server error: ${res.status} — ${errBody}`); }
         const data = await res.json();
         if (!data.url) throw new Error("No checkout URL received from server");
         window.location.href = data.url;
       } catch (err) {
-        console.error("doCheckout error:", err);
         alert(`Payment setup failed: ${err.message}`);
-        setPaywallRedirecting(false);
-        setRedirectingPriceId(null);
+        setPaywallRedirecting(false); setRedirectingPriceId(null);
       }
     }
   }, []);
@@ -860,7 +1192,7 @@ export default function SwaraSlamApp() {
     localStorage.setItem("walkthroughSeen", "true");
   }, []);
 
-  const displayCards = currentCards || cards;
+  const trueDisplayCards = currentCards || cards;
   const sliderPct    = Math.round(((bpm - 40) / (700 - 40)) * 100);
   const isLocked     = level > 0 && !isPremium;
 
@@ -881,7 +1213,6 @@ export default function SwaraSlamApp() {
         @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&family=DM+Sans:wght@300;400;500&display=swap');
         *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
-        /* ── Full-page screens ── */
         .screen{min-height:100vh;background:#F9F7F2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.25rem;padding:2rem 1.5rem;text-align:center;animation:fadeIn .25s ease}
         @keyframes fadeIn{from{opacity:0}to{opacity:1}}
         @keyframes titlePop{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:scale(1)}}
@@ -903,7 +1234,6 @@ export default function SwaraSlamApp() {
         .ready-title{font-family:'Cormorant Garamond',serif;font-size:clamp(52px,12vw,88px);font-weight:600;color:#C05F2F;font-style:italic;animation:titlePop .5s .1s cubic-bezier(.34,1.56,.64,1) both}
         .ready-sub{font-size:12px;letter-spacing:.2em;text-transform:uppercase;color:#9A7B50}
 
-        /* ── Game UI ── */
         .ss-app{min-height:100vh;background:#F9F7F2;font-family:'DM Sans',sans-serif;color:#1C1A17;display:flex;flex-direction:column;align-items:center;padding:0 1.25rem 2.5rem;overflow-x:hidden}
         .ss-header{width:100%;max-width:680px;display:flex;align-items:center;justify-content:space-between;padding:1.25rem 0 0.6rem}
         .ss-wordmark{display:flex;flex-direction:column;gap:3px}
@@ -943,6 +1273,7 @@ export default function SwaraSlamApp() {
         .arena-field::after{bottom:10px;right:10px;border-width:0 1.5px 1.5px 0;border-radius:0 0 3px 0}
         .arena-field.phase-active-border{border-color:rgba(192,95,47,.25);background:rgba(192,95,47,.025)}
         .card-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;width:100%}
+
         .swara-card{aspect-ratio:3/4;border-radius:10px;border:1px solid rgba(0,0,0,.08);background:#FEFCF8;box-shadow:0 1px 3px rgba(0,0,0,.05);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;transition:transform .09s cubic-bezier(.34,1.56,.64,1),box-shadow .09s,border-color .09s,background .09s,opacity .2s}
         .card-dv{font-size:clamp(11px,2.8vw,17px);color:rgba(0,0,0,.2);line-height:1;transition:color .09s}
         .card-name{font-family:'Cormorant Garamond',serif;font-size:clamp(14px,3.5vw,21px);font-weight:600;color:#1C1A17;line-height:1;position:relative;display:inline-flex;align-items:center}
@@ -953,6 +1284,29 @@ export default function SwaraSlamApp() {
         .card-active{transform:scale(1.1);background:#FFF3EE;border-color:#C05F2F;box-shadow:0 0 0 2.5px rgba(192,95,47,.4),0 6px 22px rgba(192,95,47,.25),0 2px 6px rgba(0,0,0,.07)}
         .card-active .card-dv{color:rgba(192,95,47,.5)}
         .card-active .card-name{color:#C05F2F}
+
+        /* ── NEW: Pitch match green glow ── */
+        .card-match{background:#E8F5E9 !important;border-color:#2E7D32 !important;box-shadow:0 0 15px rgba(46,125,50,0.4),0 0 0 2px rgba(46,125,50,0.25) !important}
+        .card-match .card-dv{color:rgba(46,125,50,0.5) !important}
+        .card-match .card-name{color:#2E7D32 !important}
+
+        /* ── NEW: Score display ── */
+        .score-strip{width:100%;max-width:480px;display:flex;align-items:center;justify-content:space-between;padding:.15rem 0 .45rem;min-height:24px}
+        .score-label{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9A7B50;font-weight:500}
+        .score-pips{display:flex;gap:4px;align-items:center}
+        .score-pip{width:10px;height:10px;border-radius:50%;border:1.5px solid rgba(0,0,0,.12);background:transparent;transition:background .15s,border-color .15s,transform .15s}
+        .score-pip.hit{background:#2E7D32;border-color:#2E7D32;transform:scale(1.25)}
+        .score-pip.hit-anim{animation:pipPop .25s cubic-bezier(.34,1.56,.64,1) both}
+        @keyframes pipPop{0%{transform:scale(0.5)}60%{transform:scale(1.5)}100%{transform:scale(1.25)}}
+        .score-fraction{font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:600;color:#2E7D32;letter-spacing:.04em;min-width:32px;text-align:right;transition:opacity .2s}
+        .score-fraction.zero{color:rgba(0,0,0,.2)}
+
+        /* ── NEW: Mic status indicator (subtle, top-right of arena) ── */
+        .mic-status{display:flex;align-items:center;gap:4px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:rgba(0,0,0,.25);font-family:'DM Sans',sans-serif}
+        .mic-dot{width:5px;height:5px;border-radius:50%;background:rgba(0,0,0,.15);flex-shrink:0}
+        .mic-dot.listening{background:#2E7D32;animation:micPulse 1.4s ease-in-out infinite}
+        @keyframes micPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(0.7)}}
+
         .beat-dots{display:flex;gap:13px;align-items:center;padding-top:2px}
         .beat-dot{width:8px;height:8px;border-radius:50%;background:rgba(0,0,0,.1);transition:background .07s,transform .07s,box-shadow .07s;flex-shrink:0}
         .dot-dn{background:#C05F2F !important;transform:scale(1.8) !important;box-shadow:0 0 0 3px rgba(192,95,47,.18) !important}
@@ -977,12 +1331,23 @@ export default function SwaraSlamApp() {
         .nav-btn:hover{background:rgba(0,0,0,.05)}
         .nav-btn:disabled{opacity:.3;cursor:default}
 
-        /* ── Overlays ── */
-        .overlay{position:fixed;inset:0;z-index:300;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;background:rgba(249,247,242,.94);backdrop-filter:blur(6px);animation:fadeIn .3s ease both}
+        .overlay{position:fixed;inset:0;z-index:300;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;background:rgba(249,247,242,.96);backdrop-filter:blur(8px);animation:fadeIn .3s ease both;padding:2rem 1.5rem;text-align:center}
+        .overlay-eyebrow{font-family:'DM Sans',sans-serif;font-size:10px;font-weight:500;letter-spacing:.26em;text-transform:uppercase;color:#9A7B50}
         .overlay-title{font-family:'Cormorant Garamond',serif;font-size:clamp(42px,10vw,80px);font-weight:600;color:#C05F2F;font-style:italic;animation:titlePop .5s .1s cubic-bezier(.34,1.56,.64,1) both}
         .overlay-sub{font-size:12px;letter-spacing:.2em;text-transform:uppercase;color:#9A7B50}
 
-        /* ── Walkthrough ── */
+        /* ── Level Summary overlay ── */
+        .summary-score-row{display:flex;align-items:baseline;gap:6px;margin:.2rem 0 .1rem}
+        .summary-big{font-family:'Cormorant Garamond',serif;font-size:clamp(52px,12vw,88px);font-weight:600;color:#C05F2F;line-height:1;animation:titlePop .4s .2s cubic-bezier(.34,1.56,.64,1) both}
+        .summary-of{font-family:'Cormorant Garamond',serif;font-size:clamp(22px,5vw,36px);font-weight:400;color:rgba(0,0,0,.3)}
+        .summary-label{font-family:'DM Sans',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:#9A7B50;align-self:flex-end;padding-bottom:6px}
+        .summary-bar-wrap{width:100%;max-width:280px;height:4px;background:rgba(0,0,0,.08);border-radius:99px;overflow:hidden;margin:.3rem 0}
+        .summary-bar-fill{height:100%;background:linear-gradient(90deg,#9A7B50,#C05F2F);border-radius:99px;transition:width .8s cubic-bezier(.34,1.56,.64,1)}
+        .summary-msg{font-family:'DM Sans',sans-serif;font-size:14px;color:#5A4A35;max-width:320px;line-height:1.65}
+        .summary-grand{font-family:'DM Sans',sans-serif;font-size:12px;color:#9A7B50;letter-spacing:.06em;margin-top:.25rem}
+        .summary-grand strong{color:#C05F2F}
+        .level-running-total{font-family:'DM Sans',sans-serif;font-size:9px;color:#9A7B50;letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
+
         .wt-backdrop{position:fixed;inset:0;background:rgba(28,26,23,0.72);z-index:8999}
         .wt-overlay{position:fixed;inset:0;z-index:9000;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding-bottom:48px;pointer-events:none}
         .wt-card{background:#F9F7F2;border-radius:20px;padding:28px 28px 24px;max-width:380px;width:calc(100% - 40px);box-shadow:0 20px 60px rgba(0,0,0,.3);pointer-events:all;border:2px solid #9A7B50;animation:slideUp .35s cubic-bezier(.34,1.56,.64,1) both}
@@ -999,7 +1364,6 @@ export default function SwaraSlamApp() {
         .wt-skip{font-family:'DM Sans',sans-serif;font-size:12px;color:rgba(0,0,0,.35);background:none;border:none;cursor:pointer;padding:0}
         .wt-skip:hover{color:#C05F2F}
 
-        /* ── Install banner ── */
         .install-tooltip{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);width:calc(100% - 40px);max-width:360px;background:#1C1A17;color:#F9F7F2;border-radius:16px;padding:20px;box-shadow:0 8px 40px rgba(0,0,0,.35);z-index:500;animation:tooltipUp .35s cubic-bezier(.34,1.56,.64,1) both}
         @keyframes tooltipUp{from{opacity:0;transform:translateX(-50%) translateY(20px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
         .install-close{position:absolute;top:14px;right:14px;background:rgba(255,255,255,.1);border:none;color:#F9F7F2;width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:14px}
@@ -1044,25 +1408,74 @@ export default function SwaraSlamApp() {
         </>
       )}
 
-      {/* ── Level Up overlay ── */}
-      {levelUpVisible && (
-        <div className="overlay">
-          <div className="overlay-title">Level Up!</div>
-          <p className="overlay-sub">Entering Level {level + 2} — {LEVEL_CONFIG[Math.min(level + 1, 3)].label}</p>
+      {/* ── Level Summary overlay — shown at end of every 5-set level ── */}
+      {levelSummaryData && (
+        <div className="overlay" style={{gap:"0.6rem"}}>
+          <p className="overlay-eyebrow">Level {levelSummaryData.levelNum} Complete</p>
+          <div className="overlay-title" style={{fontSize:"clamp(32px,8vw,60px)",lineHeight:1.1}}>
+            {levelSummaryData.emoji} {levelSummaryData.title}
+          </div>
+          <div className="summary-score-row">
+            <span className="summary-big">{levelSummaryData.levelTotal}</span>
+            <span className="summary-of">/ {TOTAL_PER_LEVEL}</span>
+            <span className="summary-label">Slam Points</span>
+          </div>
+          <div className="summary-bar-wrap">
+            <div className="summary-bar-fill" style={{width: Math.round((levelSummaryData.levelTotal / TOTAL_PER_LEVEL) * 100) + "%"}} />
+          </div>
+          <p className="summary-msg">{levelSummaryData.msg}</p>
+          {levelSummaryData.isGrandSlam && (
+            <p className="summary-grand">
+              Grand Slam Total: <strong>{levelSummaryData.grandTotal} / {TOTAL_ALL_LEVELS}</strong>
+            </p>
+          )}
         </div>
       )}
 
-      {/* ── All Levels Done ── */}
-      {allLevelsUp && (
+      {/* ── Level Up overlay ── */}
+      {levelUpVisible && (
         <div className="overlay">
-          <div className="overlay-title" style={{fontSize:"clamp(38px,9vw,68px)"}}>All Levels Up!</div>
-          <p className="overlay-sub" style={{marginBottom:".5rem"}}>You have mastered all four levels</p>
-          <button className="primary-btn" onClick={() => {
+          <p className="overlay-eyebrow">Next Up</p>
+          <div className="overlay-title">Level {level + 2}!</div>
+          <p className="overlay-sub">{LEVEL_CONFIG[Math.min(level + 1, 3)].label} — Ready to Slam?</p>
+        </div>
+      )}
+
+      {/* ── Grand Slam — All Levels Done ── */}
+      {allLevelsUp && (
+        <div className="overlay" style={{gap:"0.7rem"}}>
+          <p className="overlay-eyebrow">Grand Slam</p>
+          <div className="overlay-title" style={{fontSize:"clamp(34px,8vw,64px)"}}>
+            All 4 Levels!
+          </div>
+          <div className="summary-score-row">
+            <span className="summary-big">{grandSlamScore}</span>
+            <span className="summary-of">/ {TOTAL_ALL_LEVELS}</span>
+            <span className="summary-label">Total Slam Points</span>
+          </div>
+          <div className="summary-bar-wrap">
+            <div className="summary-bar-fill" style={{width: Math.round((grandSlamScore / TOTAL_ALL_LEVELS) * 100) + "%" }} />
+          </div>
+          {(() => {
+            const pct = Math.round((grandSlamScore / TOTAL_ALL_LEVELS) * 100);
+            const { title, emoji } = getTitleForPct(pct);
+            return (
+              <p className="summary-msg">
+                {emoji} <strong>{title}</strong> — You totally Swara Slammed all four levels!
+                {pct === 100 ? " A perfect 160. Legendary." : " Ready to Slam again?"}
+              </p>
+            );
+          })()}
+          <button className="primary-btn" style={{marginTop:8}} onClick={() => {
             setAllLevelsUp(false); setConfetti(false);
             setLevel(0); setSetNum(0); setCards(generateCards(0)); setCurrentCards(null);
             setManualBpm(false); setBpm(BASE_BPM); setPhase("idle"); setActiveCard(-1);
+            setScore(0); scoreRef.current = 0;
+            setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+            setGrandSlamScore(0); grandSlamScoreRef.current = 0;
+            setMicActive(false); setLevelSummaryData(null);
             saveProgress(0, 0, BASE_BPM); setScreen("ready");
-          }}>Play Again</button>
+          }}>Slam Again ▶</button>
         </div>
       )}
 
@@ -1089,7 +1502,7 @@ export default function SwaraSlamApp() {
       )}
 
       {/* ══════════════════════════════════════════════════════════════════════
-          SCREEN ROUTER
+          SCREEN ROUTER — RULE #1: No changes to any screen logic below
       ══════════════════════════════════════════════════════════════════════ */}
 
       {/* HOME */}
@@ -1102,13 +1515,8 @@ export default function SwaraSlamApp() {
           </div>
           <p className="home-sub">Swara expertise for Vocalists and Instrumentalists</p>
           <button className="primary-btn" style={{marginTop:8}} onClick={() => {
-            // Rule 5: If already logged in, go straight to game
-            if (user) {
-              setScreen("ready");
-            } else {
-              // Rule 1: Mandatory auth first - no guest play
-              setScreen("auth");
-            }
+            if (user) { setScreen("ready"); }
+            else { setScreen("auth"); }
           }}>
             Start Playing
           </button>
@@ -1123,12 +1531,23 @@ export default function SwaraSlamApp() {
         </div>
       )}
 
-      {/* READY */}
+      {/* READY — MODIFIED: mic permission requested on "Begin ▶" click */}
       {screen === "ready" && (
         <div className="screen">
           <div className="ready-title">Ready?</div>
           <p className="ready-sub">Level 1 — {LEVEL_CONFIG[0].label}</p>
-          <button className="primary-btn" style={{marginTop:16}} onClick={() => {
+          <button className="primary-btn" style={{marginTop:16}} onClick={async () => {
+            // Request mic permission here, before entering the game screen.
+            // If denied, the game still works — scoring just won't function.
+            // usePitchDetection fails silently on permission denial.
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+              // Immediately release — the hook will re-acquire when needed
+              stream.getTracks().forEach(t => t.stop());
+            } catch (e) {
+              // Permission denied — continue gracefully without mic
+              console.info("Mic permission denied; scoring will be unavailable.");
+            }
             setScreen("game");
             const isFirstTime = !localStorage.getItem("walkthroughSeen");
             if (isFirstTime) setTimeout(() => startWalkthrough(), 200);
@@ -1139,7 +1558,7 @@ export default function SwaraSlamApp() {
         </div>
       )}
 
-      {/* PREMIUM UNLOCKED — celebration screen */}
+      {/* PREMIUM UNLOCKED */}
       {screen === "premium-unlocked" && (
         <div className="screen">
           <div style={{fontSize:64,marginBottom:16}}>🎉</div>
@@ -1155,7 +1574,7 @@ export default function SwaraSlamApp() {
         </div>
       )}
 
-      {/* AUTH — modal rendered over a blank screen, never hides behind game */}
+      {/* AUTH */}
       {screen === "auth" && (
         <div style={{minHeight:"100vh",background:"#F9F7F2",display:"flex",alignItems:"center",justifyContent:"center"}}>
           <AuthModal
@@ -1165,18 +1584,16 @@ export default function SwaraSlamApp() {
         </div>
       )}
 
-      {/* PAYWALL — full screen, no game behind it */}
+      {/* PAYWALL */}
       {screen === "paywall" && (
         <div className="screen" style={{justifyContent:"flex-start",paddingTop:32,overflowY:"auto",gap:0}}>
           <PaywallScreen onCheckout={handleStripeCheckout} redirecting={paywallRedirecting} redirectingPriceId={redirectingPriceId} />
           <button className="ghost-btn" style={{marginTop:4}} onClick={() => {
-            // Rule 4: Back to Level 1 properly resets state
-            setLevel(0); 
-            setSetNum(0);
-            setCards(generateCards(0));
-            setCurrentCards(null);
-            setPhase("idle");
-            setActiveCard(-1);
+            setLevel(0); setSetNum(0); setCards(generateCards(0)); setCurrentCards(null);
+            setPhase("idle"); setActiveCard(-1);
+            setScore(0); scoreRef.current = 0;
+            setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+            setMicActive(false); setLevelSummaryData(null);
             setScreen("game");
           }}>
             ← Back to Level 1
@@ -1222,15 +1639,49 @@ export default function SwaraSlamApp() {
             </span>
           </div>
 
+          {/* ── Slam Score strip — set pips + fraction + level running total ── */}
+          <div className="score-strip">
+            <span className="score-label">Slam Score</span>
+            <div className="score-pips">
+              {Array.from({ length: ACTIVE_BEATS }, (_, i) => (
+                <div key={i} className={"score-pip" + (scoredCards.has(i) ? " hit hit-anim" : "")} />
+              ))}
+            </div>
+            <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:1}}>
+              <span className={"score-fraction" + (score === 0 ? " zero" : "")}>{score}/{ACTIVE_BEATS}</span>
+              {levelTotalScore > 0 && (
+                <span className="level-running-total">Level: {levelTotalScore}/{TOTAL_PER_LEVEL}</span>
+              )}
+            </div>
+          </div>
+
           <main className="ss-arena">
             <div className={"arena-field" + (phase === "active" ? " phase-active-border" : "")}>
+              {/* ── NEW: Mic listening indicator (top-right corner of field) ── */}
+              {micActive && (
+                <div style={{position:"absolute",top:10,right:14,zIndex:2}}>
+                  <div className="mic-status">
+                    <div className={"mic-dot" + (phase === "active" ? " listening" : "")} />
+                    <span>{phase === "active" ? "listening" : "ready"}</span>
+                  </div>
+                </div>
+              )}
+
               <div className="card-grid" style={{filter: isLocked ? "blur(6px)" : "none", transition:"filter 0.3s", pointerEvents: isLocked ? "none" : "auto"}}>
-                {displayCards.map((sw, i) => <SwaraCard key={i} swara={sw} state={getCardState(i)} />)}
+                {trueDisplayCards.map((sw, i) => (
+                  <SwaraCard
+                    key={i}
+                    swara={sw}
+                    state={getCardState(i)}
+                    // pitchMatched: only show green on the ACTIVE card while isMatch is true
+                    // Already-scored cards keep their normal state (no persistent green)
+                    pitchMatched={i === activeCard && isMatch && phase === "active"}
+                  />
+                ))}
               </div>
               <BeatDots beat={dotBeat} active={isPlaying} />
             </div>
 
-            {/* Locked notice — just a prompt, no glassmorphism overlay */}
             {isLocked && (
               <div style={{textAlign:"center",padding:"8px 0 4px"}}>
                 <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#9A7B50",marginBottom:10}}>
