@@ -205,6 +205,7 @@ function usePitchDetection({ isActive, targetFreq }) {
 }
 
 // ─── Auth Modal ───────────────────────────────────────────────────────────────
+// mode: "signup" | "login" | "forgot" | "forgot-sent"
 function AuthModal({ onClose, onAuthSuccess }) {
   const [mode, setMode]                   = useState("signup");
   const [email, setEmail]                 = useState("");
@@ -216,11 +217,30 @@ function AuthModal({ onClose, onAuthSuccess }) {
   const [message, setMessage]             = useState("");
   const [honeypot, setHoneypot]           = useState("");
 
+  // ── Friendly error mapper ────────────────────────────────────────────────
+  // Translates raw Supabase/network errors into plain human language.
+  const friendlyError = (err) => {
+    const msg = err?.message ?? String(err);
+    if (msg.includes("rate limit") || msg.includes("too many") || msg.includes("429"))
+      return "Our email system is a little busy right now — please wait a few minutes and try again. ☕";
+    if (msg.includes("already registered") || msg.includes("already exists") || msg.includes("User already"))
+      return "This email already has an account. Try logging in instead!";
+    if (msg.includes("Invalid login") || msg.includes("invalid_credentials") || msg.includes("Invalid email or password"))
+      return "Email or password didn't match. Double-check and try again.";
+    if (msg.includes("Email not confirmed"))
+      return "Please confirm your email first — check your inbox for the activation link.";
+    if (msg.includes("network") || msg.includes("fetch"))
+      return "Connection issue — check your internet and try again.";
+    // Fallback: show raw but still strip Supabase boilerplate
+    return msg.replace(/^AuthApiError:\s*/i, "");
+  };
+
+  // ── Sign up / Log in ─────────────────────────────────────────────────────
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (honeypot) return;
+    if (honeypot) return; // bot trap
     if (mode === "signup" && !termsAccepted) {
-      setError("Please accept the Terms & Conditions to continue");
+      setError("Please accept the Terms & Conditions to continue.");
       return;
     }
     setLoading(true); setError(""); setMessage("");
@@ -235,35 +255,260 @@ function AuthModal({ onClose, onAuthSuccess }) {
           }
         });
         if (err) {
-          if (err.message.includes("already registered") || err.message.includes("already exists")) {
-            setError("This email is already registered. Please log in.");
-            setTimeout(() => setMode("login"), 2000);
-          } else { throw err; }
+          // Duplicate account — nudge to login without throwing
+          if (err.message.includes("already registered") || err.message.includes("already exists") || err.message.includes("User already")) {
+            setError("This email already has an account. Switching you to login…");
+            setTimeout(() => { setMode("login"); setError(""); }, 2000);
+          } else {
+            setError(friendlyError(err));
+          }
           return;
         }
         if (data.user) {
-          const needsConfirmation = !data.session;
-          if (needsConfirmation) {
-            setMessage("✅ Verification email sent! Please check your inbox and click the link to activate your account.");
+          if (!data.session) {
+            // Email confirmation required (Supabase setting: confirm emails = ON)
+            setMessage("✅ Almost there! We've sent a confirmation link to your inbox. Click it to activate your account and start Slamming.");
           } else {
+            // Auto-confirmed (e.g. local dev / confirm emails = OFF)
             await supabase.from("profiles").update({
               marketing_consent: marketingConsent,
               terms_accepted: true,
               terms_accepted_at: new Date().toISOString(),
             }).eq("id", data.user.id);
-            setMessage("✅ Account created successfully!");
+            setMessage("✅ Account created — your Swara journey starts now!");
             setTimeout(() => onAuthSuccess(data.user), 1000);
           }
         }
       } else {
+        // Login
         const { data, error: err } = await supabase.auth.signInWithPassword({ email, password });
-        if (err) throw err;
+        if (err) { setError(friendlyError(err)); return; }
         if (data.user && !data.user.email_confirmed_at) {
-          setError("Please confirm your email address before logging in. Check your inbox for the confirmation link.");
+          setError("Your email isn't confirmed yet. Check your inbox for the activation link.");
           return;
         }
         if (data.user) onAuthSuccess(data.user);
       }
+    } catch (err) {
+      setError(friendlyError(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Password recovery ────────────────────────────────────────────────────
+  const handleForgotPassword = async (e) => {
+    e.preventDefault();
+    if (!email.trim()) { setError("Enter your email address above first."); return; }
+    setLoading(true); setError(""); setMessage("");
+    try {
+      const { error: err } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: "https://swara-slam.vercel.app/reset-password",
+      });
+      if (err) { setError(friendlyError(err)); return; }
+      setMode("forgot-sent");
+    } catch (err) {
+      setError(friendlyError(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const s = {
+    overlay:   { position:"fixed",inset:0,backgroundColor:"rgba(28,26,23,0.82)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999999,backdropFilter:"blur(5px)" },
+    modal:     { backgroundColor:"#F9F7F2",borderRadius:16,padding:"36px 36px 32px",maxWidth:440,width:"90%",boxShadow:"0 20px 60px rgba(192,95,47,0.22)",position:"relative",border:"2px solid #9A7B50",maxHeight:"90vh",overflowY:"auto" },
+    closeBtn:  { position:"absolute",top:14,right:14,background:"none",border:"none",cursor:"pointer",padding:8,opacity:0.45,lineHeight:0 },
+    logo:      { textAlign:"center",marginBottom:16 },
+    heading:   { fontFamily:"'Cormorant Garamond',serif",fontSize:28,fontWeight:600,color:"#1C1A17",textAlign:"center",margin:"0 0 5px" },
+    sub:       { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#6B6560",textAlign:"center",margin:"0 0 24px",lineHeight:1.5 },
+    form:      { display:"flex",flexDirection:"column",gap:13 },
+    input:     { fontFamily:"'DM Sans',sans-serif",fontSize:15,padding:13,border:"1.5px solid #E5DFD3",borderRadius:8,backgroundColor:"#fff",color:"#1C1A17",outline:"none" },
+    checkRow:  { display:"flex",alignItems:"flex-start",gap:10,fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#6B6560",lineHeight:1.5 },
+    error:     { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#C05F2F",backgroundColor:"rgba(192,95,47,0.08)",padding:"10px 12px",borderRadius:8,textAlign:"center",border:"1px solid rgba(192,95,47,0.2)",lineHeight:1.5 },
+    success:   { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#2E7D32",backgroundColor:"#E8F5E9",padding:"10px 12px",borderRadius:8,textAlign:"center",lineHeight:1.5 },
+    btn:       { fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:600,padding:14,backgroundColor:"#C05F2F",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",marginTop:2,transition:"background .15s" },
+    toggle:    { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#6B6560",textAlign:"center",marginTop:18 },
+    toggleBtn: { background:"none",border:"none",color:"#C05F2F",fontWeight:600,cursor:"pointer",textDecoration:"underline",padding:0,fontFamily:"'DM Sans',sans-serif",fontSize:13 },
+    ghostLink: { background:"none",border:"none",color:"#9A7B50",cursor:"pointer",fontSize:12,fontFamily:"'DM Sans',sans-serif",textDecoration:"underline",padding:0,marginTop:2 },
+    link:      { color:"#C05F2F",textDecoration:"underline" },
+  };
+
+  // ── Heading & subheading copy by mode ────────────────────────────────────
+  const copy = {
+    signup:      { h: "Create Free Account",      sub: "Sign up to save your Slam progress and unlock levels." },
+    login:       { h: "Back to the Slam",          sub: "Your Swara journey continues right here." },
+    forgot:      { h: "Reset Your Password",       sub: "Enter your email and we'll send you a reset link." },
+    "forgot-sent": { h: "Check Your Inbox",        sub: "A password reset link is on its way." },
+  };
+
+  return (
+    <div style={s.overlay}>
+      <div style={s.modal}>
+        <button style={s.closeBtn} onClick={onClose} aria-label="Close">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="#1C1A17" strokeWidth="2" strokeLinecap="round"/></svg>
+        </button>
+
+        {/* ── Branding: RaagGuru · Swara Slam ── */}
+        <div style={s.logo}>
+          <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:6,marginBottom:3}}>
+            <span style={{fontFamily:"'Cormorant Garamond',serif",fontSize:15,fontWeight:600,color:"#9A7B50",letterSpacing:".04em"}}>RaagGuru</span>
+            <span style={{fontFamily:"'DM Sans',sans-serif",fontSize:9,fontWeight:500,color:"#9A7B50",letterSpacing:".18em",textTransform:"uppercase",alignSelf:"center",opacity:.7}}>presents</span>
+          </div>
+          <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:7}}>
+            <span style={{fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,color:"#1C1A17",lineHeight:1}}>Swara</span>
+            <span style={{fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,fontStyle:"italic",color:"#C05F2F",lineHeight:1}}>Slam</span>
+          </div>
+        </div>
+
+        <h2 style={s.heading}>{copy[mode].h}</h2>
+        <p style={s.sub}>{copy[mode].sub}</p>
+
+        {/* ── Forgot-sent confirmation state — no form needed ── */}
+        {mode === "forgot-sent" && (
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:44,marginBottom:12}}>📬</div>
+            <div style={{...s.success,marginBottom:20}}>
+              We've sent a reset link to <strong>{email}</strong>. Check your inbox (and spam folder) — it expires in 1 hour.
+            </div>
+            <button style={s.btn} onClick={() => { setMode("login"); setError(""); setMessage(""); }}>
+              Back to Log In
+            </button>
+          </div>
+        )}
+
+        {/* ── Signup / Login / Forgot form ── */}
+        {mode !== "forgot-sent" && (
+          <form onSubmit={mode === "forgot" ? handleForgotPassword : handleSubmit} style={s.form}>
+            {/* Honeypot — invisible to humans */}
+            <input type="text" name="website_verification" value={honeypot}
+              onChange={e => setHoneypot(e.target.value)}
+              style={{position:"absolute",left:"-9999px",width:1,height:1,opacity:0}}
+              tabIndex={-1} autoComplete="off"
+            />
+
+            <input
+              type="email" placeholder="Email address"
+              value={email} onChange={e => setEmail(e.target.value)}
+              required style={s.input} autoComplete="email"
+            />
+
+            {/* Password field — hidden on forgot-password view */}
+            {mode !== "forgot" && (
+              <input
+                type="password"
+                placeholder={mode === "signup" ? "Create a password (min. 6 chars)" : "Password"}
+                value={password} onChange={e => setPassword(e.target.value)}
+                required minLength={6} style={s.input} autoComplete={mode === "signup" ? "new-password" : "current-password"}
+              />
+            )}
+
+            {/* Forgot Password link — login view only, below password field */}
+            {mode === "login" && (
+              <button type="button" style={{...s.ghostLink,textAlign:"right",alignSelf:"flex-end"}}
+                onClick={() => { setMode("forgot"); setError(""); setMessage(""); }}>
+                Forgot password?
+              </button>
+            )}
+
+            {/* Signup-only checkboxes */}
+            {mode === "signup" && (
+              <>
+                <label style={s.checkRow}>
+                  <input type="checkbox" checked={termsAccepted} onChange={e => setTerms(e.target.checked)}
+                    style={{width:16,height:16,accentColor:"#C05F2F",flexShrink:0,marginTop:2}} />
+                  <span>I agree to the{" "}
+                    <a href="#" style={s.link} onClick={e => { e.preventDefault(); alert("Terms & Conditions coming soon!"); }}>Terms & Conditions</a>
+                    {" "}and{" "}
+                    <a href="#" style={s.link} onClick={e => { e.preventDefault(); alert("Privacy Policy coming soon!"); }}>Privacy Policy</a>
+                  </span>
+                </label>
+                <label style={s.checkRow}>
+                  <input type="checkbox" checked={marketingConsent} onChange={e => setMktConsent(e.target.checked)}
+                    style={{width:16,height:16,accentColor:"#C05F2F",flexShrink:0,marginTop:2}} />
+                  <span>Keep me in the loop on new RaagGuru features</span>
+                </label>
+              </>
+            )}
+
+            {error   && <div style={s.error} role="alert">{error}</div>}
+            {message && <div style={s.success} role="status">{message}</div>}
+
+            <button
+              type="submit"
+              disabled={loading || (mode === "signup" && !termsAccepted)}
+              style={{...s.btn, opacity:(loading || (mode === "signup" && !termsAccepted)) ? 0.5 : 1}}
+            >
+              {loading
+                ? "One moment…"
+                : mode === "login"   ? "Log In & Slam →"
+                : mode === "forgot"  ? "Send Reset Link"
+                :                      "Create Account & Play"}
+            </button>
+
+            {/* Cancel link on forgot-password view */}
+            {mode === "forgot" && (
+              <button type="button" style={{...s.ghostLink,textAlign:"center",alignSelf:"center"}}
+                onClick={() => { setMode("login"); setError(""); }}>
+                ← Back to Log In
+              </button>
+            )}
+          </form>
+        )}
+
+        {/* ── Mode toggle footer (signup ↔ login only) ── */}
+        {(mode === "signup" || mode === "login") && (
+          <div style={s.toggle}>
+            {mode === "login"
+              ? <>New here?{" "}<button type="button" onClick={() => { setMode("signup"); setError(""); setMessage(""); }} style={s.toggleBtn}>Create a free account</button></>
+              : <>Already Slamming?{" "}<button type="button" onClick={() => { setMode("login"); setError(""); setMessage(""); }} style={s.toggleBtn}>Log In</button></>
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Reset Password Modal ─────────────────────────────────────────────────────
+// Shown on screen === "reset-password" after the user arrives via the email link.
+// Supabase has already exchanged the token for a session by the time this renders,
+// so we only need supabase.auth.updateUser() — no token handling required here.
+function ResetPasswordModal({ onSuccess }) {
+  const [newPassword,  setNewPassword]  = useState("");
+  const [confirmPass,  setConfirmPass]  = useState("");
+  const [loading,      setLoading]      = useState(false);
+  const [error,        setError]        = useState("");
+  const [done,         setDone]         = useState(false);
+
+  const handleReset = async (e) => {
+    e.preventDefault();
+    setError("");
+    if (newPassword.length < 6) {
+      setError("Password must be at least 6 characters.");
+      return;
+    }
+    if (newPassword !== confirmPass) {
+      setError("Passwords don't match — check both fields.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const { error: err } = await supabase.auth.updateUser({ password: newPassword });
+      if (err) {
+        // Friendly map for the most common reset errors
+        if (err.message.includes("same password") || err.message.includes("should be different"))
+          setError("New password must be different from your current one.");
+        else if (err.message.includes("expired") || err.message.includes("invalid"))
+          setError("This reset link has expired. Please request a new one from the login screen.");
+        else
+          setError(err.message.replace(/^AuthApiError:\s*/i, ""));
+        return;
+      }
+      // Clean the recovery hash from the URL immediately
+      window.history.replaceState({}, "", window.location.pathname);
+      setDone(true);
+      // Brief celebratory pause, then hand off to parent
+      setTimeout(() => onSuccess(), 1800);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -272,78 +517,99 @@ function AuthModal({ onClose, onAuthSuccess }) {
   };
 
   const s = {
-    overlay:   { position:"fixed",inset:0,backgroundColor:"rgba(28,26,23,0.8)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999999,backdropFilter:"blur(4px)" },
-    modal:     { backgroundColor:"#F9F7F2",borderRadius:16,padding:"40px 40px 36px",maxWidth:440,width:"90%",boxShadow:"0 20px 60px rgba(192,95,47,0.2)",position:"relative",border:"2px solid #9A7B50" },
-    closeBtn:  { position:"absolute",top:14,right:14,background:"none",border:"none",cursor:"pointer",padding:8,opacity:0.5 },
-    logo:      { textAlign:"center",marginBottom:20,fontSize:26 },
-    heading:   { fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,color:"#1C1A17",textAlign:"center",margin:"0 0 6px" },
-    sub:       { fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:"0 0 28px" },
-    form:      { display:"flex",flexDirection:"column",gap:14 },
-    input:     { fontFamily:"'DM Sans',sans-serif",fontSize:15,padding:13,border:"1.5px solid #E5DFD3",borderRadius:8,backgroundColor:"#fff",color:"#1C1A17",outline:"none" },
-    checkRow:  { display:"flex",alignItems:"flex-start",gap:10,fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#6B6560",lineHeight:1.5 },
-    error:     { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#D84315",backgroundColor:"#FFEBEE",padding:10,borderRadius:6,textAlign:"center" },
-    success:   { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#2E7D32",backgroundColor:"#E8F5E9",padding:10,borderRadius:6,textAlign:"center" },
-    btn:       { fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:600,padding:15,backgroundColor:"#C05F2F",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",marginTop:4 },
-    toggle:    { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#6B6560",textAlign:"center",marginTop:20 },
-    toggleBtn: { background:"none",border:"none",color:"#C05F2F",fontWeight:600,cursor:"pointer",textDecoration:"underline",padding:0 },
-    link:      { color:"#C05F2F",textDecoration:"underline" },
+    wrap:      { minHeight:"100vh",background:"#F9F7F2",display:"flex",alignItems:"center",justifyContent:"center",padding:"1.5rem" },
+    card:      { backgroundColor:"#F9F7F2",borderRadius:18,padding:"40px 36px 36px",maxWidth:420,width:"100%",boxShadow:"0 20px 60px rgba(192,95,47,0.18)",border:"2px solid #9A7B50",textAlign:"center" },
+    logoRow:   { marginBottom:18 },
+    eyebrow:   { fontFamily:"'DM Sans',sans-serif",fontSize:9,fontWeight:500,letterSpacing:".22em",textTransform:"uppercase",color:"#9A7B50",marginBottom:4 },
+    brandRow:  { display:"flex",alignItems:"baseline",justifyContent:"center",gap:6 },
+    swara:     { fontFamily:"'Cormorant Garamond',serif",fontSize:28,fontWeight:600,color:"#1C1A17",lineHeight:1 },
+    slam:      { fontFamily:"'Cormorant Garamond',serif",fontSize:28,fontWeight:600,fontStyle:"italic",color:"#C05F2F",lineHeight:1 },
+    heading:   { fontFamily:"'Cormorant Garamond',serif",fontSize:26,fontWeight:600,color:"#1C1A17",margin:"0 0 6px" },
+    sub:       { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#6B6560",margin:"0 0 24px",lineHeight:1.55 },
+    form:      { display:"flex",flexDirection:"column",gap:12,textAlign:"left" },
+    label:     { fontFamily:"'DM Sans',sans-serif",fontSize:10,fontWeight:500,letterSpacing:".14em",textTransform:"uppercase",color:"#9A7B50",marginBottom:4,display:"block" },
+    input:     { fontFamily:"'DM Sans',sans-serif",fontSize:15,padding:13,border:"1.5px solid #E5DFD3",borderRadius:8,backgroundColor:"#fff",color:"#1C1A17",outline:"none",width:"100%" },
+    inputFocus:{ borderColor:"#C05F2F" },
+    error:     { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#C05F2F",background:"rgba(192,95,47,0.07)",padding:"10px 12px",borderRadius:8,border:"1px solid rgba(192,95,47,0.18)",lineHeight:1.5 },
+    btn:       { fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:600,padding:14,backgroundColor:"#C05F2F",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",marginTop:4,transition:"background .15s,transform .1s",letterSpacing:".03em" },
+    successBox:{ display:"flex",flexDirection:"column",alignItems:"center",gap:14 },
+    tick:      { fontSize:52 },
+    successMsg:{ fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#2E7D32",background:"#E8F5E9",padding:"12px 16px",borderRadius:8,lineHeight:1.55,maxWidth:320 },
+    hint:      { fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",letterSpacing:".06em" },
   };
 
   return (
-    <div style={s.overlay}>
-      <div style={s.modal}>
-        <button style={s.closeBtn} onClick={onClose}>
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="#1C1A17" strokeWidth="2" strokeLinecap="round"/></svg>
-        </button>
-        <div style={s.logo}>
-          <span style={{fontFamily:"'Cormorant Garamond',serif",color:"#9A7B50",fontWeight:600}}>Raag</span>
-          <span style={{fontFamily:"'DM Sans',sans-serif",color:"#C05F2F",fontWeight:600,letterSpacing:1}}>GURU</span>
+    <div style={s.wrap}>
+      <div style={s.card}>
+        {/* Brand lockup */}
+        <div style={s.logoRow}>
+          <p style={s.eyebrow}>Re-enter the arena</p>
+          <div style={s.brandRow}>
+            <span style={s.swara}>Swara</span>
+            <span style={s.slam}>Slam</span>
+          </div>
         </div>
-        <h2 style={s.heading}>{mode === "login" ? "Welcome Back" : "Create Free Account"}</h2>
-        <p style={s.sub}>{mode === "login" ? "Continue your Swara practice" : "Sign up to save progress & unlock levels"}</p>
-        <form onSubmit={handleSubmit} style={s.form}>
-          <input
-            type="text" name="website_verification" value={honeypot}
-            onChange={e => setHoneypot(e.target.value)}
-            style={{position:"absolute",left:"-9999px",width:1,height:1,opacity:0}}
-            tabIndex={-1} autoComplete="off"
-          />
-          <input type="email" placeholder="Email address" value={email} onChange={e => setEmail(e.target.value)} required style={s.input} />
-          <input type="password" placeholder="Password (min. 6 characters)" value={password} onChange={e => setPassword(e.target.value)} required minLength={6} style={s.input} />
-          {mode === "signup" && (
-            <>
-              <label style={s.checkRow}>
-                <input type="checkbox" checked={termsAccepted} onChange={e => setTerms(e.target.checked)} style={{width:17,height:17,accentColor:"#C05F2F",flexShrink:0,marginTop:2}} />
-                <span>I agree to the{" "}
-                  <a href="#" style={s.link} onClick={e => { e.preventDefault(); alert("Terms & Conditions coming soon!"); }}>Terms & Conditions</a>
-                  {" "}and{" "}
-                  <a href="#" style={s.link} onClick={e => { e.preventDefault(); alert("Privacy Policy coming soon!"); }}>Privacy Policy</a>
-                </span>
-              </label>
-              <label style={s.checkRow}>
-                <input type="checkbox" checked={marketingConsent} onChange={e => setMktConsent(e.target.checked)} style={{width:17,height:17,accentColor:"#C05F2F",flexShrink:0,marginTop:2}} />
-                <span>Keep me updated on new RaagGuru features</span>
-              </label>
-            </>
-          )}
-          {error   && <div style={s.error}>{error}</div>}
-          {message && <div style={s.success}>{message}</div>}
-          <button type="submit" disabled={loading || (mode === "signup" && !termsAccepted)}
-            style={{...s.btn, opacity:(loading || (mode === "signup" && !termsAccepted)) ? 0.5 : 1}}>
-            {loading ? "Processing…" : mode === "login" ? "Log In" : "Create Account"}
-          </button>
-        </form>
-        <div style={s.toggle}>
-          {mode === "login"
-            ? <>Don't have an account?{" "}<button type="button" onClick={() => setMode("signup")} style={s.toggleBtn}>Sign Up</button></>
-            : <>Already have an account?{" "}<button type="button" onClick={() => setMode("login")} style={s.toggleBtn}>Log In</button></>}
-        </div>
+
+        {done ? (
+          /* ── Success state ── */
+          <div style={s.successBox}>
+            <span style={s.tick}>🔓</span>
+            <h2 style={{...s.heading,marginBottom:0}}>You're Back In!</h2>
+            <div style={s.successMsg}>
+              Password updated. Your Swara journey continues — heading to the arena now…
+            </div>
+            <p style={s.hint}>Taking you to the Ready screen…</p>
+          </div>
+        ) : (
+          /* ── Password entry form ── */
+          <>
+            <h2 style={s.heading}>Set Your New Password</h2>
+            <p style={s.sub}>
+              Choose a strong password to reclaim your spot in the arena.
+            </p>
+            <form onSubmit={handleReset} style={s.form}>
+              <div>
+                <label style={s.label} htmlFor="rp-new">New Password</label>
+                <input
+                  id="rp-new"
+                  type="password"
+                  placeholder="At least 6 characters"
+                  value={newPassword}
+                  onChange={e => setNewPassword(e.target.value)}
+                  required minLength={6}
+                  style={s.input}
+                  autoComplete="new-password"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label style={s.label} htmlFor="rp-confirm">Confirm Password</label>
+                <input
+                  id="rp-confirm"
+                  type="password"
+                  placeholder="Repeat your new password"
+                  value={confirmPass}
+                  onChange={e => setConfirmPass(e.target.value)}
+                  required minLength={6}
+                  style={s.input}
+                  autoComplete="new-password"
+                />
+              </div>
+              {error && <div style={s.error} role="alert">{error}</div>}
+              <button
+                type="submit"
+                disabled={loading}
+                style={{...s.btn, opacity: loading ? 0.55 : 1}}
+              >
+                {loading ? "Updating…" : "Update & Start Slamming 🎵"}
+              </button>
+            </form>
+          </>
+        )}
       </div>
     </div>
   );
 }
-
-// ─── Paywall Screen ───────────────────────────────────────────────────────────
 function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
   const btnBase = { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"13px 24px",color:"#fff",border:"none",borderRadius:8,cursor:redirecting?"not-allowed":"pointer",width:"100%" };
   const isRedirecting = (priceId) => redirecting && redirectingPriceId === priceId;
@@ -750,7 +1016,6 @@ export default function SwaraSlamApp() {
   const [bpm,            setBpm]            = useState(BASE_BPM);
   const [manualBpm,      setManualBpm]      = useState(false);
   const [bpmFlash,       setBpmFlash]       = useState(false);
-  const [levelUpVisible, setLevelUpVisible] = useState(false);
   const [confetti,       setConfetti]       = useState(false);
   const [allLevelsUp,    setAllLevelsUp]    = useState(false);
 
@@ -865,8 +1130,17 @@ export default function SwaraSlamApp() {
     }
   }, [phase]);
 
-  // ── Session restore ────────────────────────────────────────────────────────
+  // ── Session restore & persistence ─────────────────────────────────────────
+  // Strategy:
+  //   1. Stripe return params handled first (before any auth check).
+  //   2. getSession() on mount — if a valid session exists, restore silently
+  //      and route directly to "home" (not "auth"). Supabase persists sessions
+  //      in localStorage automatically; this just reads what's already there.
+  //   3. onAuthStateChange keeps state in sync for the lifetime of the tab.
+  //      It only updates React state — it never drives screen changes — so it
+  //      cannot interfere with the Stripe, pitch-detection, or paywall flows.
   useEffect(() => {
+    // ── 1. Stripe return URLs ──────────────────────────────────────────────
     const params = new URLSearchParams(window.location.search);
     if (params.get("success") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
@@ -885,32 +1159,96 @@ export default function SwaraSlamApp() {
           setScreen("premium-unlocked");
           setTimeout(() => setScreen("game"), 3500);
         } else if (attempts < maxAttempts) {
-          setTimeout(checkPremiumStatus, 1000 * attempts);
+          setTimeout(checkPremiumStatus, 1000 * attempts); // exponential backoff
         } else {
           alert("Payment received but premium status not updated. Please refresh the page or contact support.");
           setScreen("game");
         }
       };
       setTimeout(checkPremiumStatus, 1000);
-    } else if (params.get("canceled") === "true") {
+      return; // Don't fall through to session restore when handling Stripe return
+    }
+
+    if (params.get("canceled") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
     }
 
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session?.user) { setUser(session.user); userRef.current = session.user; loadProfile(session.user.id); }
+    // ── 2. Restore persisted session on mount ─────────────────────────────
+    // Supabase stores the session JWT in localStorage. getSession() reads it
+    // synchronously from storage (no network call if the token is still valid).
+    // If found, we load the player's profile and land them on "home" —
+    // they will never see the auth screen unless they explicitly log out.
+    supabase.auth.getSession().then(({ data: { session }, error }) => {
+      if (error) { console.warn("Session restore error:", error.message); return; }
+      if (session?.user) {
+        setUser(session.user);
+        userRef.current = session.user;
+        // loadProfile sets level, setNum, isPremium — then we route to home
+        loadProfile(session.user.id).then(() => {
+          // Only route if we're still on the initial "home" screen
+          // (don't override a Stripe redirect that already changed the screen)
+          setScreen(prev => prev === "home" ? "home" : prev);
+        });
+      }
+      // No session → stay on "home" → user will click "Start Playing" → auth screen
     });
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, session) => {
+    // ── 3. Auth state change listener — state sync only, except recovery ──
+    // onAuthStateChange fires PASSWORD_RECOVERY when Supabase detects the
+    // #access_token + type=recovery hash and exchanges it for a session.
+    // This is the correct point to route to the reset screen — the session
+    // is fully established by the time this fires, so updateUser() will work.
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY" && session?.user) {
+        // Route to reset-password screen immediately.
+        // Do NOT call loadProfile or change other state — the user is mid-recovery.
+        setUser(session.user);
+        userRef.current = session.user;
+        setScreen("reset-password");
+        return;
+      }
       if (session?.user) {
-        setUser(session.user); userRef.current = session.user;
+        setUser(session.user);
+        userRef.current = session.user;
         loadProfile(session.user.id);
       } else {
+        // SIGNED_OUT — clear everything
         setUser(null); userRef.current = null;
         setIsPremium(false); isPremiumRef.current = false;
       }
     });
+
     return () => subscription.unsubscribe();
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // loadProfile intentionally excluded — it's stable and defined before this effect
+
+  // ── Hash listener — catches #type=recovery on the initial URL load ────────
+  // Supabase email links look like:
+  //   https://swara-slam.vercel.app/reset-password#access_token=...&type=recovery
+  // Since we're a SPA with no /reset-password route, Vercel serves index.html
+  // for all paths. The hash is still present on mount, but onAuthStateChange
+  // (above) will fire PASSWORD_RECOVERY once Supabase processes the fragment.
+  // This useEffect is a belt-and-suspenders guard: if the component mounts
+  // with #type=recovery already in the hash AND onAuthStateChange fires before
+  // we attach the listener, we catch it here too.
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (hash.includes("type=recovery")) {
+      // Don't clean the hash yet — Supabase needs it to exchange the token.
+      // onAuthStateChange will fire PASSWORD_RECOVERY shortly after mount;
+      // setScreen("reset-password") happens there. This just ensures we're
+      // ready for that transition even if the effect ordering differs.
+      // If for any reason onAuthStateChange already fired before this effect
+      // ran, check for an existing session and route directly.
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (session?.user) {
+          setUser(session.user);
+          userRef.current = session.user;
+          setScreen("reset-password");
+        }
+      });
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadProfile = async (userId) => {
     try {
@@ -961,99 +1299,52 @@ export default function SwaraSlamApp() {
   }, [setNum, level]);
 
   // ── Advance set/level ──────────────────────────────────────────────────────
-  // RULE #1: Paywall / auth / navigation logic unchanged.
-  // Added: sound effects, levelTotalScore accumulation, Level Summary overlay.
+  // Level 1 free users: play all 5 sets uninterrupted.
+  // Paywall only appears via the Level Summary CTA after Set 5.
+  // All level transitions are now manual (player presses Continue on Summary card).
   const advanceSet = useCallback((lvl, sn) => {
-    const nextSet    = sn + 1;
-    const setScore_  = scoreRef.current; // snapshot before any resets
+    const nextSet   = sn + 1;
 
-    // ── Free users on Level 1 (unchanged paywall logic) ──────────────────
-    if (lvl === 0 && !isPremiumRef.current && userRef.current) {
-      engine.playSetDing();
-      if (nextSet >= SETS_PER_LEVEL) {
-        setConfetti(true);
-        setTimeout(() => setConfetti(false), 3200);
-        setTimeout(() => {
-          setLevel(0); setSetNum(0);
-          setCards(generateCards(0)); setCurrentCards(null);
-          if (!manualBpmRef.current) setBpm(BASE_BPM);
-          setScore(0); scoreRef.current = 0;
-          setLevelTotalScore(0); levelTotalScoreRef.current = 0;
-          setScreen("paywall");
-        }, 3200);
-        return;
-      } else {
-        setSetNum(nextSet);
-        setCards(generateCards(0)); setCurrentCards(null);
-        const newBpm = manualBpmRef.current ? bpmRef.current : BASE_BPM + nextSet * BPM_INCREMENT;
-        if (!manualBpmRef.current) setBpm(newBpm);
-        saveProgress(0, nextSet, newBpm);
-        setTimeout(() => setScreen("paywall"), 1500);
-        return;
-      }
-    }
-
-    // ── End of a level (Set 5 completed) ─────────────────────────────────
-    if (nextSet >= SETS_PER_LEVEL) {
-      const nextLevel  = lvl + 1;
-      const levelTotal = levelTotalScoreRef.current; // all 5 sets accumulated
-      const pct        = Math.round((levelTotal / TOTAL_PER_LEVEL) * 100);
-      const summary    = getLevelSummaryMessage(levelTotal, TOTAL_PER_LEVEL);
-
-      // Play level-up arpeggio (more celebratory than ding)
-      engine.playLevelUpArp();
-      setConfetti(true); setTimeout(() => setConfetti(false), 3200);
-      if (nextLevel === 1) setHasCompletedLevel1(true);
-
-      if (nextLevel >= LEVEL_CONFIG.length) {
-        // All 4 levels done — grand slam
-        engine.playGrandSlamFanfare();
-        setLevelSummaryData({
-          ...summary,
-          levelTotal,
-          levelNum: lvl + 1,
-          isGrandSlam: true,
-          grandTotal: grandSlamScoreRef.current,
-        });
-        // Show level summary first, then grand slam overlay
-        setTimeout(() => {
-          setLevelSummaryData(null);
-          setAllLevelsUp(true);
-        }, 5000);
-      } else {
-        // Normal level completion — show Level Summary, then advance
-        setLevelSummaryData({
-          ...summary,
-          levelTotal,
-          levelNum: lvl + 1,
-          isGrandSlam: false,
-          grandTotal: grandSlamScoreRef.current,
-        });
-        setTimeout(() => {
-          setLevelSummaryData(null);
-          setLevelUpVisible(true);
-          // Reset level total for next level
-          setLevelTotalScore(0); levelTotalScoreRef.current = 0;
-          setTimeout(() => {
-            setLevelUpVisible(false);
-            setLevel(nextLevel); setSetNum(0);
-            setCards(generateCards(nextLevel)); setCurrentCards(null);
-            if (!manualBpmRef.current) setBpm(BASE_BPM);
-            setScore(0); scoreRef.current = 0;
-            saveProgress(nextLevel, 0, BASE_BPM);
-          }, 2800);
-        }, 4800);
-      }
-
-    // ── Mid-level set completed ───────────────────────────────────────────
-    } else {
+    // ── Mid-level set completed (applies to ALL users, ALL levels) ────────
+    // Free users on Level 1 are no longer interrupted mid-level.
+    if (nextSet < SETS_PER_LEVEL) {
       engine.playSetDing();
       setSetNum(nextSet);
       setCards(generateCards(lvl)); setCurrentCards(null);
       const newBpm = manualBpmRef.current ? bpmRef.current : BASE_BPM + nextSet * BPM_INCREMENT;
       if (!manualBpmRef.current) setBpm(newBpm);
       saveProgress(lvl, nextSet, newBpm);
+      return;
     }
+
+    // ── Set 5 completed — level done ─────────────────────────────────────
+    const nextLevel  = lvl + 1;
+    const levelTotal = levelTotalScoreRef.current;
+    const summary    = getLevelSummaryMessage(levelTotal, TOTAL_PER_LEVEL);
+
+    // Sound: grand slam fanfare if all levels done, else level-up arp
+    if (nextLevel >= LEVEL_CONFIG.length) {
+      engine.playGrandSlamFanfare();
+    } else {
+      engine.playLevelUpArp();
+    }
+    setConfetti(true); setTimeout(() => setConfetti(false), 3200);
+    if (nextLevel === 1) setHasCompletedLevel1(true);
+
+    // requiresUnlock: free user trying to continue past Level 1
+    const requiresUnlock = !isPremiumRef.current && nextLevel >= 1;
+
+    // Show Level Summary card — it stays until player presses Continue / Unlock
+    setLevelSummaryData({
+      ...summary,
+      levelTotal,
+      levelNum:       lvl + 1,        // level just finished (1-indexed)
+      nextLevel,                        // level about to start
+      isGrandSlam:    nextLevel >= LEVEL_CONFIG.length,
+      grandTotal:     grandSlamScoreRef.current,
+      requiresUnlock,                   // drives button label
+    });
+    // No setTimeout — player dismisses manually
   }, [engine, saveProgress]);
 
   // ── Playback ───────────────────────────────────────────────────────────────
@@ -1117,6 +1408,44 @@ export default function SwaraSlamApp() {
     advanceSet(levelRef.current, setNumRef.current);
   }, [isPlaying, stopPlay, advanceSet]);
 
+  // ── Continue / Unlock button on Level Summary overlay ─────────────────────
+  // Called when player presses "Continue to Level X" or "Unlock Next Level".
+  // If requiresUnlock: dismiss summary, show paywall.
+  // Otherwise: transition to next level (or grand slam screen).
+  const handleContinueLevel = useCallback((summaryData) => {
+    setLevelSummaryData(null);
+
+    if (summaryData.isGrandSlam) {
+      // Grand slam path — show the allLevelsUp overlay
+      setAllLevelsUp(true);
+      return;
+    }
+
+    if (summaryData.requiresUnlock) {
+      // Free user finished Level 1 — send to paywall
+      // Reset Level 1 state so they can replay after subscribing
+      setLevel(0); setSetNum(0);
+      setCards(generateCards(0)); setCurrentCards(null);
+      if (!manualBpmRef.current) setBpm(BASE_BPM);
+      setScore(0); scoreRef.current = 0;
+      setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+      setScreen("paywall");
+      return;
+    }
+
+    // Premium / free-advancing: move to next level
+    const nextLevel = summaryData.nextLevel;
+    setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+    setLevel(nextLevel); setSetNum(0);
+    setCards(generateCards(nextLevel)); setCurrentCards(null);
+    if (!manualBpmRef.current) setBpm(BASE_BPM);
+    setScore(0); scoreRef.current = 0;
+    setScoredCards(new Set()); scoredCardsRef.current = new Set();
+    setPhase("idle"); setActiveCard(-1);
+    saveProgress(nextLevel, 0, BASE_BPM);
+    // levelUpVisible is no longer used — transition is immediate via this handler
+  }, [saveProgress]);
+
   const toggleDrone = useCallback(() => {
     if (!isPlaying) { setDroneOn(d => !d); return; }
     if (droneOn) { engine.stopDrone(); setDroneOn(false); }
@@ -1146,6 +1475,19 @@ export default function SwaraSlamApp() {
   const handleAuthSuccess = useCallback(async (loggedInUser) => {
     setUser(loggedInUser); userRef.current = loggedInUser;
     await loadProfile(loggedInUser.id);
+    setScreen("ready");
+  }, []);
+
+  // Called by ResetPasswordModal after supabase.auth.updateUser() succeeds.
+  // The session is already live; we just load the profile and go to "ready".
+  const handlePasswordResetSuccess = useCallback(async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session?.user) {
+      setUser(session.user);
+      userRef.current = session.user;
+      await loadProfile(session.user.id);
+    }
+    // Hash was already cleaned inside ResetPasswordModal
     setScreen("ready");
   }, []);
 
@@ -1408,11 +1750,11 @@ export default function SwaraSlamApp() {
         </>
       )}
 
-      {/* ── Level Summary overlay — shown at end of every 5-set level ── */}
+      {/* ── Level Summary overlay — persistent, dismissed only by player ── */}
       {levelSummaryData && (
-        <div className="overlay" style={{gap:"0.6rem"}}>
+        <div className="overlay" style={{gap:"0.55rem"}}>
           <p className="overlay-eyebrow">Level {levelSummaryData.levelNum} Complete</p>
-          <div className="overlay-title" style={{fontSize:"clamp(32px,8vw,60px)",lineHeight:1.1}}>
+          <div className="overlay-title" style={{fontSize:"clamp(30px,8vw,58px)",lineHeight:1.1}}>
             {levelSummaryData.emoji} {levelSummaryData.title}
           </div>
           <div className="summary-score-row">
@@ -1429,17 +1771,40 @@ export default function SwaraSlamApp() {
               Grand Slam Total: <strong>{levelSummaryData.grandTotal} / {TOTAL_ALL_LEVELS}</strong>
             </p>
           )}
+          {/* CTA — label changes based on premium status and whether all levels are done */}
+          <button
+            className="primary-btn"
+            style={{marginTop:6}}
+            onClick={() => handleContinueLevel(levelSummaryData)}
+          >
+            {levelSummaryData.isGrandSlam
+              ? "See Grand Slam Results"
+              : levelSummaryData.requiresUnlock
+                ? "🔒 Unlock Level " + (levelSummaryData.nextLevel + 1)
+                : "Continue to Level " + (levelSummaryData.nextLevel + 1) + " →"}
+          </button>
+          {/* Unlock path: ghost link to replay Level 1 instead */}
+          {levelSummaryData.requiresUnlock && (
+            <button
+              className="ghost-btn"
+              style={{marginTop:2}}
+              onClick={() => {
+                setLevelSummaryData(null);
+                setLevel(0); setSetNum(0);
+                setCards(generateCards(0)); setCurrentCards(null);
+                if (!manualBpmRef.current) setBpm(BASE_BPM);
+                setScore(0); scoreRef.current = 0;
+                setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+                setPhase("idle"); setActiveCard(-1);
+              }}
+            >
+              ← Replay Level 1
+            </button>
+          )}
         </div>
       )}
 
-      {/* ── Level Up overlay ── */}
-      {levelUpVisible && (
-        <div className="overlay">
-          <p className="overlay-eyebrow">Next Up</p>
-          <div className="overlay-title">Level {level + 2}!</div>
-          <p className="overlay-sub">{LEVEL_CONFIG[Math.min(level + 1, 3)].label} — Ready to Slam?</p>
-        </div>
-      )}
+      {/* ── Level Up flash removed — transition is now via Summary card CTA ── */}
 
       {/* ── Grand Slam — All Levels Done ── */}
       {allLevelsUp && (
@@ -1525,7 +1890,7 @@ export default function SwaraSlamApp() {
             <span style={{color:"#9A7B50",fontSize:11}}>•</span>
             {user
               ? <button className="ghost-btn" onClick={handleLogout}>Log out ({user.email.split("@")[0]})</button>
-              : <button className="ghost-btn" onClick={() => setScreen("auth")}>Sign In</button>
+              : <button className="ghost-btn" onClick={() => setScreen("auth")}>Already Slamming? Sign In</button>
             }
           </div>
         </div>
@@ -1572,6 +1937,11 @@ export default function SwaraSlamApp() {
             <div style={{width:8,height:8,borderRadius:"50%",background:"#9A7B50"}}/>
           </div>
         </div>
+      )}
+
+      {/* RESET PASSWORD — shown when user arrives via recovery email link */}
+      {screen === "reset-password" && (
+        <ResetPasswordModal onSuccess={handlePasswordResetSuccess} />
       )}
 
       {/* AUTH */}
