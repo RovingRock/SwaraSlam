@@ -17,9 +17,17 @@ function AuthModal({ onClose, onAuthSuccess }) {
   const [loading, setLoading]             = useState(false);
   const [error, setError]                 = useState("");
   const [message, setMessage]             = useState("");
+  const [honeypot, setHoneypot]           = useState(""); // Rule 2: Bot protection
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    
+    // Rule 2: Honeypot check - if filled, reject (bot)
+    if (honeypot) {
+      console.log("Bot detected via honeypot");
+      return; // Silently reject
+    }
+    
     if (mode === "signup" && !termsAccepted) {
       setError("Please accept the Terms & Conditions to continue");
       return;
@@ -27,16 +35,44 @@ function AuthModal({ onClose, onAuthSuccess }) {
     setLoading(true); setError(""); setMessage("");
     try {
       if (mode === "signup") {
-        const { data, error: err } = await supabase.auth.signUp({ email, password });
-        if (err) throw err;
+        const { data, error: err } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            emailRedirectTo: "https://swara-slam.vercel.app", // Rule 1: Production URL
+            data: {
+              marketing_consent: marketingConsent,
+            }
+          }
+        });
+        
+        // Rule 2: Check if user already exists
+        if (err) {
+          if (err.message.includes("already registered") || err.message.includes("already exists")) {
+            setError("This email is already registered. Please log in.");
+            setTimeout(() => setMode("login"), 2000);
+          } else {
+            throw err;
+          }
+          return;
+        }
+        
         if (data.user) {
-          await supabase.from("profiles").update({
-            marketing_consent: marketingConsent,
-            terms_accepted: true,
-            terms_accepted_at: new Date().toISOString(),
-          }).eq("id", data.user.id);
-          setMessage("✅ Account created! Check your email to confirm your account before logging in.");
-          // Don't auto-switch to login — user must manually click "Log In" after confirming email
+          // Rule 2 & 3: Proper confirmation message
+          const needsConfirmation = !data.session;
+          
+          if (needsConfirmation) {
+            setMessage("✅ Verification email sent! Please check your inbox and click the link to activate your account.");
+          } else {
+            await supabase.from("profiles").update({
+              marketing_consent: marketingConsent,
+              terms_accepted: true,
+              terms_accepted_at: new Date().toISOString(),
+            }).eq("id", data.user.id);
+            
+            setMessage("✅ Account created successfully!");
+            setTimeout(() => onAuthSuccess(data.user), 1000);
+          }
         }
       } else {
         const { data, error: err } = await supabase.auth.signInWithPassword({ email, password });
@@ -86,6 +122,16 @@ function AuthModal({ onClose, onAuthSuccess }) {
         <h2 style={s.heading}>{mode === "login" ? "Welcome Back" : "Create Free Account"}</h2>
         <p style={s.sub}>{mode === "login" ? "Continue your Swara practice" : "Sign up to save progress & unlock levels"}</p>
         <form onSubmit={handleSubmit} style={s.form}>
+          {/* Rule 2: Honeypot for bot protection - hidden from humans */}
+          <input 
+            type="text" 
+            name="website_verification" 
+            value={honeypot} 
+            onChange={e => setHoneypot(e.target.value)}
+            style={{position:"absolute",left:"-9999px",width:1,height:1,opacity:0}}
+            tabIndex={-1}
+            autoComplete="off"
+          />
           <input type="email" placeholder="Email address" value={email} onChange={e => setEmail(e.target.value)} required style={s.input} />
           <input type="password" placeholder="Password (min. 6 characters)" value={password} onChange={e => setPassword(e.target.value)} required minLength={6} style={s.input} />
           {mode === "signup" && (
@@ -163,10 +209,6 @@ function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
           </button>
         </div>
       </div>
-
-      <p style={{fontFamily:"'Cormorant Garamond',serif",fontSize:16,color:"#9A7B50",opacity:0.5,margin:"8px 0 0"}}>
-        स &nbsp; र &nbsp; ग &nbsp; म
-      </p>
     </div>
   );
 }
@@ -439,11 +481,12 @@ export default function SwaraSlamApp() {
   const [allLevelsUp,    setAllLevelsUp]    = useState(false);
 
   // Auth/paywall
-  const [user,               setUser]               = useState(null);
-  const [isPremium,          setIsPremium]          = useState(false);
-  const [paywallRedirecting, setPaywallRedirecting] = useState(false);
-  const [redirectingPriceId, setRedirectingPriceId] = useState(null);
-  const [highestBpm,         setHighestBpm]         = useState(BASE_BPM);
+  const [user,                  setUser]                  = useState(null);
+  const [isPremium,             setIsPremium]             = useState(false);
+  const [hasCompletedLevel1,    setHasCompletedLevel1]    = useState(false);
+  const [paywallRedirecting,    setPaywallRedirecting]    = useState(false);
+  const [redirectingPriceId,    setRedirectingPriceId]    = useState(null);
+  const [highestBpm,            setHighestBpm]            = useState(BASE_BPM);
 
   // Walkthrough
   const [showWalkthrough, setShowWalkthrough] = useState(false);
@@ -477,39 +520,61 @@ export default function SwaraSlamApp() {
     const params = new URLSearchParams(window.location.search);
     if (params.get("success") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
-      // Give webhook time to process (it's async), then check premium status
-      setTimeout(async () => {
+      
+      // Aggressive retry pattern for webhook completion
+      let attempts = 0;
+      const maxAttempts = 5;
+      
+      const checkPremiumStatus = async () => {
+        attempts++;
+        console.log(`Checking premium status (attempt ${attempts}/${maxAttempts})...`);
+        
         const { data: { session } } = await supabase.auth.getSession();
-        if (session?.user) {
-          const premium = await loadProfile(session.user.id);
-          if (premium) {
-            // Success! Show celebration
-            setConfetti(true);
-            setTimeout(() => setConfetti(false), 3500);
-            setScreen("premium-unlocked");
-            setTimeout(() => setScreen("game"), 3500);
-          } else {
-            // Webhook might still be processing, wait a bit more
-            console.log("Premium not yet updated, waiting...");
-            setTimeout(async () => {
-              const stillPremium = await loadProfile(session.user.id);
-              if (stillPremium) {
-                setConfetti(true);
-                setTimeout(() => setConfetti(false), 3500);
-                setScreen("premium-unlocked");
-                setTimeout(() => setScreen("game"), 3500);
-              } else {
-                // Something went wrong
-                alert("Payment received but premium status not updated. Please contact support or try logging out and back in.");
-                setScreen("paywall");
-              }
-            }, 2000);
-          }
+        if (!session?.user) {
+          console.error("No session found");
+          return;
         }
-      }, 1000); // Initial 1 second delay for webhook
+        
+        // Force a fresh database read (bypass any caching)
+        const { data: profile, error } = await supabase
+          .from("profiles")
+          .select("is_premium")
+          .eq("id", session.user.id)
+          .single();
+        
+        console.log("Profile check:", profile, "Error:", error);
+        
+        if (profile?.is_premium) {
+          // Success! Update all state
+          setIsPremium(true);
+          isPremiumRef.current = true;
+          userRef.current = session.user;
+          setUser(session.user);
+          
+          console.log("✓ Premium confirmed! Showing celebration...");
+          
+          // Show celebration
+          setConfetti(true);
+          setTimeout(() => setConfetti(false), 3500);
+          setScreen("premium-unlocked");
+          setTimeout(() => setScreen("game"), 3500);
+        } else if (attempts < maxAttempts) {
+          // Not premium yet, retry after delay
+          console.log(`Not premium yet, retrying in ${1000 * attempts}ms...`);
+          setTimeout(checkPremiumStatus, 1000 * attempts); // Exponential backoff
+        } else {
+          // Give up after max attempts
+          console.error("Premium status not updated after", maxAttempts, "attempts");
+          alert("Payment received but premium status not updated. Please refresh the page or contact support.");
+          setScreen("game"); // At least let them play Level 1
+        }
+      };
+      
+      // Start checking after 1 second (give webhook a head start)
+      setTimeout(checkPremiumStatus, 1000);
+      
     } else if (params.get("canceled") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
-      // Stay on current screen (probably paywall)
     }
 
     // Silently restore session
@@ -538,13 +603,18 @@ export default function SwaraSlamApp() {
       const lvl = Math.max(0, (data.current_level || 1) - 1);
       const sn  = Math.max(0, (data.current_set   || 1) - 1);
       const premium = data.is_premium || false;
+      
+      // User has completed Level 1 if they're on Level 2+ OR (on Level 1 but past all sets)
+      const completedL1 = lvl >= 1 || (lvl === 0 && sn >= SETS_PER_LEVEL);
+      
       setLevel(lvl); setSetNum(sn);
       setIsPremium(premium); 
+      setHasCompletedLevel1(completedL1);
       isPremiumRef.current = premium; // Critical: sync ref immediately
       userRef.current = user; // Also sync user ref
       setHighestBpm(data.last_bpm || data.highest_bpm || BASE_BPM);
       setCards(generateCards(lvl)); setCurrentCards(null);
-      console.log("loadProfile: isPremium =", premium, "for user", userId.substring(0, 8));
+      console.log("loadProfile: isPremium =", premium, "completedL1 =", completedL1, "for user", userId.substring(0, 8));
       return premium;
     } catch (e) { console.error("loadProfile:", e); return false; }
   };
@@ -584,26 +654,44 @@ export default function SwaraSlamApp() {
   // ── Advance set/level ──────────────────────────────────────────────────────
   const advanceSet = useCallback((lvl, sn) => {
     const nextSet = sn + 1;
+    
+    // Rule 3: For Level 1 non-premium users, show paywall after EACH set as gentle reminder
+    if (lvl === 0 && !isPremiumRef.current && userRef.current) {
+      // Non-premium user just finished a Level 1 set
+      if (nextSet >= SETS_PER_LEVEL) {
+        // Finished all 5 sets - show bigger celebration, then paywall
+        setConfetti(true); 
+        setTimeout(() => setConfetti(false), 3200);
+        setTimeout(() => {
+          setLevel(0); setSetNum(0); // Reset to Level 1 start
+          setCards(generateCards(0)); setCurrentCards(null);
+          if (!manualBpmRef.current) setBpm(BASE_BPM);
+          setScreen("paywall");
+        }, 3200);
+        return;
+      } else {
+        // Finished a set (but not all 5) - advance and show quick paywall reminder
+        setSetNum(nextSet);
+        setCards(generateCards(0)); setCurrentCards(null);
+        const newBpm = manualBpmRef.current ? bpmRef.current : BASE_BPM + nextSet * BPM_INCREMENT;
+        if (!manualBpmRef.current) setBpm(newBpm);
+        saveProgress(0, nextSet, newBpm);
+        
+        // Show paywall as gentle reminder (they can click Back to Level 1)
+        setTimeout(() => setScreen("paywall"), 1500);
+        return;
+      }
+    }
+    
+    // Standard level progression for premium users or Level 2+
     if (nextSet >= SETS_PER_LEVEL) {
       const nextLevel = lvl + 1;
       setConfetti(true); setTimeout(() => setConfetti(false), 3200);
 
       if (nextLevel === 1) {
-        if (!userRef.current) {
-          // Not logged in → Auth screen after confetti
-          setTimeout(() => setScreen("auth"), 3200);
-          return;
-        }
-        if (!isPremiumRef.current) {
-          // Logged in, not premium → Paywall screen after confetti
-          setTimeout(() => {
-            setLevel(1); setSetNum(0);
-            setCards(generateCards(1)); setCurrentCards(null);
-            if (!manualBpmRef.current) setBpm(BASE_BPM);
-            setScreen("paywall");
-          }, 3200);
-          return;
-        }
+        // This shouldn't happen anymore (Level 1 handled above)
+        // But keep for safety
+        setHasCompletedLevel1(true);
       }
 
       if (nextLevel >= LEVEL_CONFIG.length) {
@@ -619,6 +707,7 @@ export default function SwaraSlamApp() {
         }, 3000);
       }
     } else {
+      // Mid-level set progression
       setSetNum(nextSet);
       setCards(generateCards(lvl)); setCurrentCards(null);
       const newBpm = manualBpmRef.current ? bpmRef.current : BASE_BPM + nextSet * BPM_INCREMENT;
@@ -696,15 +785,16 @@ export default function SwaraSlamApp() {
   }, [stopPlay]);
 
   // Called after login (not signup — signup requires email confirm first)
+  // Called after login (not signup — signup requires email confirm first)
   const handleAuthSuccess = useCallback(async (loggedInUser) => {
     setUser(loggedInUser); userRef.current = loggedInUser;
-    const premium = await loadProfile(loggedInUser.id);
-    if (premium) {
-      setScreen("game");
-    } else {
-      setLevel(1); setSetNum(0); setCards(generateCards(1)); setCurrentCards(null); setBpm(BASE_BPM);
-      setScreen("paywall");
-    }
+    
+    // Load their profile to get current progress
+    await loadProfile(loggedInUser.id);
+    
+    // Rule 3: Always route non-premium users to Ready → Level 1
+    // Premium users also start at their saved progress (loaded above)
+    setScreen("ready");
   }, []);
 
   // Stripe checkout — user is guaranteed logged in when PaywallScreen is shown
@@ -957,7 +1047,6 @@ export default function SwaraSlamApp() {
       {/* ── Level Up overlay ── */}
       {levelUpVisible && (
         <div className="overlay">
-          <p className="ready-ornament">स &nbsp; र &nbsp; ग &nbsp; म</p>
           <div className="overlay-title">Level Up!</div>
           <p className="overlay-sub">Entering Level {level + 2} — {LEVEL_CONFIG[Math.min(level + 1, 3)].label}</p>
         </div>
@@ -1012,7 +1101,15 @@ export default function SwaraSlamApp() {
             <span className="home-slam">Slam</span>
           </div>
           <p className="home-sub">Swara expertise for Vocalists and Instrumentalists</p>
-          <button className="primary-btn" style={{marginTop:8}} onClick={() => setScreen("ready")}>
+          <button className="primary-btn" style={{marginTop:8}} onClick={() => {
+            // Rule 5: If already logged in, go straight to game
+            if (user) {
+              setScreen("ready");
+            } else {
+              // Rule 1: Mandatory auth first - no guest play
+              setScreen("auth");
+            }
+          }}>
             Start Playing
           </button>
           <div style={{display:"flex",gap:16,alignItems:"center",marginTop:4}}>
@@ -1029,7 +1126,6 @@ export default function SwaraSlamApp() {
       {/* READY */}
       {screen === "ready" && (
         <div className="screen">
-          <p className="ready-ornament">स &nbsp; र &nbsp; ग &nbsp; म</p>
           <div className="ready-title">Ready?</div>
           <p className="ready-sub">Level 1 — {LEVEL_CONFIG[0].label}</p>
           <button className="primary-btn" style={{marginTop:16}} onClick={() => {
@@ -1073,7 +1169,16 @@ export default function SwaraSlamApp() {
       {screen === "paywall" && (
         <div className="screen" style={{justifyContent:"flex-start",paddingTop:32,overflowY:"auto",gap:0}}>
           <PaywallScreen onCheckout={handleStripeCheckout} redirecting={paywallRedirecting} redirectingPriceId={redirectingPriceId} />
-          <button className="ghost-btn" style={{marginTop:4}} onClick={() => setScreen("game")}>
+          <button className="ghost-btn" style={{marginTop:4}} onClick={() => {
+            // Rule 4: Back to Level 1 properly resets state
+            setLevel(0); 
+            setSetNum(0);
+            setCards(generateCards(0));
+            setCurrentCards(null);
+            setPhase("idle");
+            setActiveCard(-1);
+            setScreen("game");
+          }}>
             ← Back to Level 1
           </button>
         </div>
