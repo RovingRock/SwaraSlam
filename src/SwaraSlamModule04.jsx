@@ -1039,29 +1039,26 @@ function LegalModal({ onClose }) {
 }
 
 // ─── Paywall Screen ───────────────────────────────────────────────────────────
-// Reads localStorage directly for the play count so the subtitle is always
-// accurate, even before React state has synced after a round completes.
+// ABSOLUTE SOURCE OF TRUTH: reads localStorage directly.
+// Profile fetch errors (HTTP 400, RLS gaps, network failures) have zero effect
+// on what this component displays. Database state is never consulted here.
 function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
   const btnBase = { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"13px 24px",color:"#fff",border:"none",borderRadius:8,cursor:redirecting?"not-allowed":"pointer",width:"100%" };
   const isRedirecting = (priceId) => redirecting && redirectingPriceId === priceId;
-  // Read directly from localStorage — ground truth regardless of React timing
-  // and regardless of whether the Supabase profile fetch succeeded or failed.
-  // A profile 400 / load error must never drop this back to the 0-plays copy
-  // when the user has already played rounds (task spec fail-safe requirement).
-  const currentPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
-  const remaining = Math.max(0, 5 - currentPlays);
-  // Priority order: locked copy → remaining copy → default copy.
-  // currentPlays is always authoritative; profile state is never consulted here.
-  const displayMessage = currentPlays >= 5
-    ? "You’ve mastered your first 5 sets! To continue your Riyaz and unlock all 4 levels, choose a plan below."
-    : currentPlays > 0
-      ? `You have [${remaining}] Free slam${remaining === 1 ? "" : "s"} remaining. To continue Swara slamming and unlock all levels, choose a plan below.`
-      : "Level 1 is free. Unlock chromatic swaras, advanced jumps, and three octaves with full access.";
+
+  // HARD OVERRIDE: localStorage is the odometer — profile state is ignored.
+  // If localStorage says >= 5, force locked copy instantly regardless of
+  // whether the Supabase profiles query succeeded, failed, or hasn't run yet.
+  const localPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+  const subtitleText = localPlays >= 5
+    ? "You've mastered your first 5 sets! To continue your Riyaz and unlock all 4 levels, choose a plan below."
+    : `You have [${Math.max(0, 5 - localPlays)}] Free slam${Math.max(0, 5 - localPlays) === 1 ? "" : "s"} remaining. To continue Swara slamming and unlock all levels, choose a plan below.`;
+
   return (
     <div style={{width:"100%",maxWidth:480,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",gap:20,padding:"32px 16px"}}>
       <div style={{fontSize:44}}>🔒</div>
       <h2 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,color:"#1C1A17",margin:0,textAlign:"center"}}>Unlock All 4 Levels</h2>
-      <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>{displayMessage}</p>
+      <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>{subtitleText}</p>
       <div style={{display:"flex",gap:16,flexWrap:"wrap",justifyContent:"center",width:"100%",marginTop:8}}>
         <div style={{background:"#fff",border:"1.5px solid #E5DFD3",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center"}}>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>24-HOUR PASS</div>
@@ -1480,6 +1477,9 @@ export default function SwaraSlamApp() {
   const [user,               setUser]               = useState(null);
   const [isPremium,          setIsPremium]          = useState(false);
   const [hasCompletedLevel1, setHasCompletedLevel1] = useState(false);
+  // profileLoadError: true when loadProfile fails (400, network, no row).
+  // Used for diagnostics only — never clears freePlayCount or gating state.
+  const [profileLoadError,   setProfileLoadError]   = useState(false);
   const [paywallRedirecting, setPaywallRedirecting] = useState(false);
   const [redirectingPriceId, setRedirectingPriceId] = useState(null);
   const [highestBpm,         setHighestBpm]         = useState(BASE_BPM);
@@ -1749,11 +1749,15 @@ export default function SwaraSlamApp() {
         console.error(
           `loadProfile: both column attempts failed [${error.code}] ${error.message}`
         );
+        // Flag the error for diagnostics — do NOT touch freePlayCount or
+        // freePlayCountRef. localStorage remains the gating source of truth.
+        setProfileLoadError(true);
         return false;
       }
 
       // ── No profile row yet (new account, trigger not yet fired) ──────────
-      if (!data) return false;
+      // Not an error — row simply hasn't been created yet. Flag and return.
+      if (!data) { setProfileLoadError(true); return false; }
 
       // ── Apply profile data to React state ────────────────────────────────
       const lvl = Math.max(0, (data.current_level || 1) - 1);
@@ -1768,11 +1772,14 @@ export default function SwaraSlamApp() {
       // breaks userRef.current.id in saveProgress downstream.
       setHighestBpm(data.last_bpm || data.highest_bpm || BASE_BPM);
       setCards(generateCards(lvl)); setCurrentCards(null);
+      setProfileLoadError(false); // profile loaded successfully — clear any prior error flag
       return premium;
 
     } catch (e) {
-      // Network failure or unexpected throw — degrade gracefully
+      // Network failure or unexpected throw — degrade gracefully.
+      // freePlayCount is intentionally NOT touched here.
       console.error("loadProfile: unexpected error:", e);
+      setProfileLoadError(true);
       return false;
     }
   };
@@ -2309,6 +2316,13 @@ export default function SwaraSlamApp() {
           </button>
           {levelSummaryData.requiresUnlock && (
             <button className="ghost-btn" style={{marginTop:2}} onClick={() => {
+              // HARD BLOCK per spec: localPlays is the odometer
+              const localPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+              if (localPlays >= 5) {
+                setScreen("paywall");
+                return; // halt — do NOT reset level state when locking out
+              }
+              // Under limit — reset level state and stay on game screen
               setLevelSummaryData(null);
               setLevel(0); setSetNum(0);
               setCards(generateCards(0)); setCurrentCards(null);
@@ -2316,16 +2330,6 @@ export default function SwaraSlamApp() {
               setScore(0); scoreRef.current = 0;
               setLevelTotalScore(0); levelTotalScoreRef.current = 0;
               setPhase("idle"); setActiveCard(-1);
-              // Hard gate: read localStorage directly to guarantee correctness
-              // regardless of ref or state timing at the point this is tapped.
-              if (!isPremiumRef.current) {
-                const currentPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
-                if (currentPlays >= FREE_PLAY_LIMIT) {
-                  setScreen("paywall");
-                  return;
-                }
-              }
-              // Under the limit — stay on game screen (already on "game")
             }}>← Replay Level 1</button>
           )}
         </div>
@@ -2403,8 +2407,9 @@ export default function SwaraSlamApp() {
           </div>
           <p className="home-sub">Swara expertise for Vocalists and Instrumentalists</p>
           <button className="primary-btn" style={{marginTop:8}} onClick={() => {
-            // Persistent gate: free user who has used all plays goes to paywall
-            if (!user && freePlayCount >= FREE_PLAY_LIMIT) {
+            // HARD BLOCK: read localStorage at click time — immune to React state resets.
+            const localPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+            if (localPlays >= 5) {
               setScreen("paywall"); return;
             }
             if (user) { setScreen("ready"); }
@@ -2437,6 +2442,9 @@ export default function SwaraSlamApp() {
           <div className="ready-title">Ready?</div>
           <p className="ready-sub">Level 1 — {LEVEL_CONFIG[0].label}</p>
           <button className="primary-btn" style={{marginTop:16}} onClick={async () => {
+            // HARD BLOCK: check localStorage before doing anything else
+            const localPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+            if (localPlays >= 5) { setScreen("paywall"); return; }
             try {
               const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
               stream.getTracks().forEach(t => t.stop());
