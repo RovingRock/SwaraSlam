@@ -1496,6 +1496,7 @@ export default function SwaraSlamApp() {
   const levelRef      = useRef(level);
   const setNumRef     = useRef(setNum);
   const userRef       = useRef(user);
+  const sessionRef    = useRef(null);   // stores full session including access_token
   const isPremiumRef  = useRef(isPremium);
   const manualBpmRef  = useRef(manualBpm);
   const bpmRef        = useRef(bpm);
@@ -1674,6 +1675,7 @@ export default function SwaraSlamApp() {
         hasFetchedProfile.current = true;          // lock: one fetch per session
         setUser(session.user);
         userRef.current = session.user;
+        sessionRef.current = session;              // cache full session for PWA token access
         loadProfile(session.user.id).then(() => {
           setScreen(prev => prev === "home" ? "home" : prev);
         });
@@ -1699,6 +1701,7 @@ export default function SwaraSlamApp() {
       if (session?.user) {
         if (!session.user.email_confirmed_at) return;  // unconfirmed — block
         setUser(session.user); userRef.current = session.user;
+        sessionRef.current = session;              // cache for PWA token access
         // Route confirmed user to home if they're sitting on the auth screen.
         // This handles the email confirmation link click — Supabase fires SIGNED_IN
         // with the confirmed session, but screen is still "auth" from the signup form.
@@ -1980,6 +1983,9 @@ export default function SwaraSlamApp() {
   const handleAuthSuccess = useCallback(async (loggedInUser) => {
     setUser(loggedInUser); userRef.current = loggedInUser;
     hasFetchedProfile.current = true;  // prevent duplicate call from onAuthStateChange
+    // Cache the full session so PWA context can access the token without localStorage
+    const { data: { session: s } } = await supabase.auth.getSession();
+    if (s) sessionRef.current = s;
     await loadProfile(loggedInUser.id);
     setScreen("ready");
   }, []);
@@ -2011,25 +2017,35 @@ export default function SwaraSlamApp() {
   const handleStripeCheckout = useCallback(async (priceId) => {
     setPaywallRedirecting(true); setRedirectingPriceId(priceId);
     try {
-      // Read the raw token directly from the Supabase localStorage key.
-      // This works in both browser and PWA/installed contexts because it
-      // bypasses the Supabase client entirely — no network call, no auth events.
-      // The key format is: sb-<project-ref>-auth-token
-      const STORAGE_KEY = `sb-${import.meta.env.VITE_SUPABASE_URL.split("//")[1].split(".")[0]}-auth-token`;
+      // Token resolution — works in both browser and PWA/installed contexts.
+      // Priority order:
+      //   1. sessionRef.current  — full session cached in memory at login time.
+      //      Always available in PWA where localStorage may be partitioned.
+      //   2. getSession()        — browser fallback if sessionRef was never set.
+      //   3. localStorage direct — last resort raw key read.
       let token = null;
 
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          token = parsed?.access_token || null;
-        }
-      } catch (_) { /* storage parse failed — fall through */ }
+      // 1. In-memory session cache (reliable in PWA)
+      if (sessionRef.current?.access_token) {
+        token = sessionRef.current.access_token;
+      }
 
-      // Fallback: use getSession() if localStorage read failed
+      // 2. Supabase client getSession() (reliable in browser)
       if (!token) {
         const { data: { session } } = await supabase.auth.getSession();
-        token = session?.access_token || null;
+        if (session?.access_token) {
+          token = session.access_token;
+          sessionRef.current = session; // backfill cache
+        }
+      }
+
+      // 3. Raw localStorage read (last resort)
+      if (!token) {
+        try {
+          const STORAGE_KEY = `sb-${import.meta.env.VITE_SUPABASE_URL.split("//")[1].split(".")[0]}-auth-token`;
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) token = JSON.parse(raw)?.access_token || null;
+        } catch (_) { /* parse failed */ }
       }
 
       if (!token) {
