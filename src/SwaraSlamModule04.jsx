@@ -1586,11 +1586,17 @@ export default function SwaraSlamApp() {
       // correctly restrict is_premium to service-role-only updates (Fix 3d).
       const forcePremiumUpdate = async (userId) => {
         try {
-          const { error } = await supabaseAdmin.from("profiles")
+          // Update profiles table
+          await supabaseAdmin.from("profiles")
             .update({ is_premium: true })
             .eq("id", userId);
+          // Also set user_metadata so refreshSession() returns the flag in JWT
+          const { error } = await supabaseAdmin.auth.admin.updateUserById(
+            userId,
+            { user_metadata: { is_premium: true } }
+          );
           if (error) throw error;
-          console.log("forcePremiumUpdate: profiles row updated via service role.");
+          console.log("forcePremiumUpdate: profiles + user_metadata updated.");
         } catch (e) {
           console.error("forcePremiumUpdate failed:", e);
         }
@@ -2279,7 +2285,7 @@ export default function SwaraSlamApp() {
             const _plays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
             const _remaining = Math.max(0, 5 - _plays);
             const _summaryNote = _plays >= 5
-              ? "You've mastered your first 5 sets! Unlock all Levels to keep going."
+              ? "You've mastered your first 5 sets! Choose a plan below to keep going."
               : `You have [${_remaining}] free slam${_remaining === 1 ? "" : "s"} remaining.`;
             return (
               <>
