@@ -2275,24 +2275,34 @@ export default function SwaraSlamApp() {
                 ? "🔒 Unlock Level " + (levelSummaryData.nextLevel + 1)
                 : "Continue to Level " + (levelSummaryData.nextLevel + 1) + " →"}
           </button>
-          {levelSummaryData.requiresUnlock && (
-            <button className="ghost-btn" style={{marginTop:2}} onClick={() => {
-              // HARD BLOCK per spec: localPlays is the odometer
-              const localPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
-              if (localPlays >= 5) {
-                setScreen("paywall");
-                return; // halt — do NOT reset level state when locking out
-              }
-              // Under limit — reset level state and stay on game screen
-              setLevelSummaryData(null);
-              setLevel(0); setSetNum(0);
-              setCards(generateCards(0)); setCurrentCards(null);
-              if (!manualBpmRef.current) setBpm(BASE_BPM);
-              setScore(0); scoreRef.current = 0;
-              setLevelTotalScore(0); levelTotalScoreRef.current = 0;
-              setPhase("idle"); setActiveCard(-1);
-            }}>← Replay Level 1</button>
-          )}
+          {levelSummaryData.requiresUnlock && (() => {
+            const _plays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+            const _remaining = Math.max(0, 5 - _plays);
+            const _summaryNote = _plays >= 5
+              ? "You've mastered your first 5 sets! Choose a plan below to keep going."
+              : `You have [${_remaining}] free slam${_remaining === 1 ? "" : "s"} remaining.`;
+            return (
+              <>
+                <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:"#9A7B50",textAlign:"center",margin:"2px 0 0",letterSpacing:".02em"}}>
+                  {_summaryNote}
+                </p>
+                <button className="ghost-btn" style={{marginTop:2}} onClick={() => {
+                  const localPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+                  if (localPlays >= 5) {
+                    setScreen("paywall");
+                    return;
+                  }
+                  setLevelSummaryData(null);
+                  setLevel(0); setSetNum(0);
+                  setCards(generateCards(0)); setCurrentCards(null);
+                  if (!manualBpmRef.current) setBpm(BASE_BPM);
+                  setScore(0); scoreRef.current = 0;
+                  setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+                  setPhase("idle"); setActiveCard(-1);
+                }}>← Replay Level 1</button>
+              </>
+            );
+          })()}
         </div>
       )}
 
