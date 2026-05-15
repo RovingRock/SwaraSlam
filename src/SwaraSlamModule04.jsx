@@ -1738,6 +1738,10 @@ export default function SwaraSlamApp() {
       localStorage.removeItem('swaraslam_free_plays');
       setFreePlayCount(0); freePlayCountRef.current = 0;
       window.history.replaceState({}, "", window.location.pathname);
+      // Route to home explicitly — the confirmation link opens a fresh tab
+      // where screen starts as "home" but the previous tab may still show
+      // the signup form. Force home so the user lands correctly.
+      setScreen("home");
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1756,15 +1760,29 @@ export default function SwaraSlamApp() {
     // Premium users: metadata.is_premium = true → isPremium = true.
     // The 5-play localStorage gate works independently of this value.
     try {
+      // Check user_metadata first (set by stripe webhook via updateUserById)
       const { data: { user } } = await supabase.auth.getUser();
-      const premium = user?.user_metadata?.is_premium === true;
+      let premium = user?.user_metadata?.is_premium === true;
+
+      // If not set in metadata, check profiles table directly via service role.
+      // This covers the case where the webhook updated the profiles row but
+      // not user_metadata (e.g. older webhook version without updateUserById).
+      if (!premium && user?.id) {
+        const { data: profile } = await supabaseAdmin
+          .from("profiles")
+          .select("is_premium")
+          .eq("id", user.id)
+          .maybeSingle();
+        if (profile?.is_premium === true) premium = true;
+      }
+
       setIsPremium(premium);
       isPremiumRef.current = premium;
       setProfileLoadError(false);
       return premium;
     } catch (e) {
-      console.warn("loadProfile: could not read user metadata:", e.message);
-      setProfileLoadError(false); // not an error we care about — default to false
+      console.warn("loadProfile: could not read premium status:", e.message);
+      setProfileLoadError(false);
       return false;
     }
   };
