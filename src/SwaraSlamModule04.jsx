@@ -1610,7 +1610,7 @@ export default function SwaraSlamApp() {
 
       const checkPremiumStatus = async () => {
         attempts++;
-        console.log(\`[SwaraSlam] premium poll attempt \${attempts}/\${maxAttempts}\`);
+        console.log(`[SwaraSlam] premium poll attempt ${attempts}/${maxAttempts}`);
 
         // Step 1: get current session (fast — reads local cache)
         const { data: { session } } = await supabase.auth.getSession();
