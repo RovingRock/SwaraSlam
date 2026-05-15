@@ -2279,7 +2279,7 @@ export default function SwaraSlamApp() {
             const _plays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
             const _remaining = Math.max(0, 5 - _plays);
             const _summaryNote = _plays >= 5
-              ? "You've mastered your first 5 sets! Choose a plan below to keep going."
+              ? "You've mastered your first 5 sets! Unlock all Levels to keep going."
               : `You have [${_remaining}] free slam${_remaining === 1 ? "" : "s"} remaining.`;
             return (
               <>
