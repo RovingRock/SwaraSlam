@@ -1699,9 +1699,10 @@ export default function SwaraSlamApp() {
       if (session?.user) {
         if (!session.user.email_confirmed_at) return;  // unconfirmed — block
         setUser(session.user); userRef.current = session.user;
-        // Only call loadProfile if we haven't already fetched for this session.
-        // This prevents the infinite loop: refreshSession() → SIGNED_IN → loadProfile
-        // → error → re-render → refreshSession() → SIGNED_IN → ...
+        // Route confirmed user to home if they're sitting on the auth screen.
+        // This handles the email confirmation link click — Supabase fires SIGNED_IN
+        // with the confirmed session, but screen is still "auth" from the signup form.
+        setScreen(prev => prev === "auth" ? "home" : prev);
         if (!hasFetchedProfile.current) {
           hasFetchedProfile.current = true;
           loadProfile(session.user.id);
