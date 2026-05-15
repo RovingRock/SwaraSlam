@@ -532,11 +532,15 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
           if (!data.session) {
             setMessage("✅ Almost there! We've sent a confirmation link to your inbox. Click it to activate your account and start Slamming.");
           } else {
-            await supabase.from("profiles").update({
+            // Fire-and-forget: do NOT await this update.
+            // A 400 from a missing column must never block onAuthSuccess.
+            supabase.from("profiles").update({
               marketing_consent: marketingConsent,
               terms_accepted: true,
               terms_accepted_at: new Date().toISOString(),
-            }).eq("id", data.user.id);
+            }).eq("id", data.user.id).then(({ error: ue }) => {
+              if (ue) console.warn("profiles update (non-blocking):", ue.message);
+            });
             setMessage("✅ Account created — your Swara journey starts now!");
             setTimeout(() => onAuthSuccess(data.user), 1000);
           }
@@ -1711,74 +1715,32 @@ export default function SwaraSlamApp() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadProfile = async (userId) => {
-    // ── Guard: userId must arrive as a non-empty string ───────────────────
-    // undefined / null / object all produce "id=eq.undefined" in PostgREST
-    // which returns HTTP 400. Coerce and exit early before any network call.
+    // Guard: coerce to string so we never send "id=eq.undefined" to PostgREST.
     const uid = String(userId || "").trim();
-    if (!uid) {
-      console.warn("loadProfile: userId empty — skipping fetch");
-      return false;
-    }
-
-    // ── Inner helper: attempt fetch with a given column name ──────────────
-    // Returns { data, error } from maybeSingle(). maybeSingle() returns
-    // { data: null, error: null } for zero rows instead of throwing PGRST116.
-    const attemptFetch = (col) =>
-      supabase.from("profiles").select("*").eq(col, uid).maybeSingle();
-
+    if (!uid) { console.warn("loadProfile: empty userId — skipped"); return false; }
     try {
-      // ── Attempt 1: standard Supabase schema uses "id" as PK ──────────────
-      let { data, error } = await attemptFetch("id");
-
-      // ── Attempt 2: some custom schemas map auth.uid() via "user_id" ──────
-      // A 400 on Attempt 1 means PostgREST rejected the filter — either the
-      // column doesn't exist in this deployment's schema, or an RLS timing
-      // gap prevented the JWT from attaching. Retry with "user_id" before
-      // giving up, so the function is schema-agnostic.
+      // Select only is_premium — the single column the gate needs.
+      // Requesting select("*") 400s if ANY column in the schema is missing
+      // (e.g. current_level, last_bpm, marketing_consent in older migrations).
+      // Narrowing to one known-safe column eliminates all schema mismatch 400s.
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("is_premium")
+        .eq("id", uid)
+        .maybeSingle();                // null data = no row; never throws PGRST116
       if (error) {
-        console.warn(
-          `loadProfile: .eq("id") error [${error.code}] ${error.message} — retrying with "user_id"`
-        );
-        const retry = await attemptFetch("user_id");
-        data  = retry.data;
-        error = retry.error;
-      }
-
-      // ── Final error: log with full code + message for debugging ───────────
-      if (error) {
-        console.error(
-          `loadProfile: both column attempts failed [${error.code}] ${error.message}`
-        );
-        // Flag the error for diagnostics — do NOT touch freePlayCount or
-        // freePlayCountRef. localStorage remains the gating source of truth.
+        console.error("loadProfile error:", error.code, error.message);
         setProfileLoadError(true);
-        return false;
+        return false;                  // degrade gracefully — freePlayCount untouched
       }
-
-      // ── No profile row yet (new account, trigger not yet fired) ──────────
-      // Not an error — row simply hasn't been created yet. Flag and return.
-      if (!data) { setProfileLoadError(true); return false; }
-
-      // ── Apply profile data to React state ────────────────────────────────
-      const lvl = Math.max(0, (data.current_level || 1) - 1);
-      const sn  = Math.max(0, (data.current_set   || 1) - 1);
+      if (!data) { setProfileLoadError(true); return false; }  // row not yet created
       const premium = data.is_premium || false;
-      const completedL1 = lvl >= 1 || (lvl === 0 && sn >= SETS_PER_LEVEL);
-      setLevel(lvl); setSetNum(sn);
-      setIsPremium(premium); setHasCompletedLevel1(completedL1);
+      setIsPremium(premium);
       isPremiumRef.current = premium;
-      // NOTE: do NOT assign userRef.current here — callers already set it to
-      // the full Supabase User object. Overwriting with a bare UUID string
-      // breaks userRef.current.id in saveProgress downstream.
-      setHighestBpm(data.last_bpm || data.highest_bpm || BASE_BPM);
-      setCards(generateCards(lvl)); setCurrentCards(null);
-      setProfileLoadError(false); // profile loaded successfully — clear any prior error flag
+      setProfileLoadError(false);
       return premium;
-
     } catch (e) {
-      // Network failure or unexpected throw — degrade gracefully.
-      // freePlayCount is intentionally NOT touched here.
-      console.error("loadProfile: unexpected error:", e);
+      console.error("loadProfile unexpected:", e);
       setProfileLoadError(true);
       return false;
     }
