@@ -1611,8 +1611,15 @@ export default function SwaraSlamApp() {
           return;
         }
 
-        const { data: profile } = await supabase
-          .from("profiles").select("is_premium").eq("id", session.user.id).single();
+        // Use maybeSingle() so a missing/RLS-blocked row returns null instead
+        // of a 400. Try "id" first; fall back to "user_id" if it errors.
+        let { data: profile, error: profileErr } = await supabase
+          .from("profiles").select("is_premium").eq("id", session.user.id).maybeSingle();
+        if (profileErr) {
+          const retry = await supabase
+            .from("profiles").select("is_premium").eq("user_id", session.user.id).maybeSingle();
+          profile = retry.data;
+        }
 
         if (profile?.is_premium) {
           // Webhook already updated the row — proceed normally
@@ -1704,21 +1711,51 @@ export default function SwaraSlamApp() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadProfile = async (userId) => {
-    // Guard: userId must be a non-empty string. Anything else (undefined,
-    // null, object) would produce a 400 from Supabase PostgREST because
-    // the filter becomes "id=eq.undefined" or "id=eq.[object Object]".
+    // ── Guard: userId must arrive as a non-empty string ───────────────────
+    // undefined / null / object all produce "id=eq.undefined" in PostgREST
+    // which returns HTTP 400. Coerce and exit early before any network call.
     const uid = String(userId || "").trim();
-    if (!uid) { console.warn("loadProfile: userId is empty — skipping fetch"); return false; }
+    if (!uid) {
+      console.warn("loadProfile: userId empty — skipping fetch");
+      return false;
+    }
+
+    // ── Inner helper: attempt fetch with a given column name ──────────────
+    // Returns { data, error } from maybeSingle(). maybeSingle() returns
+    // { data: null, error: null } for zero rows instead of throwing PGRST116.
+    const attemptFetch = (col) =>
+      supabase.from("profiles").select("*").eq(col, uid).maybeSingle();
+
     try {
-      // maybeSingle() returns { data: null, error: null } when no row exists,
-      // avoiding the "PGRST116 — multiple/no rows" error that .single() throws.
-      const { data, error } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", uid)
-        .maybeSingle();
-      if (error) { console.error("loadProfile query error:", error.message); return false; }
+      // ── Attempt 1: standard Supabase schema uses "id" as PK ──────────────
+      let { data, error } = await attemptFetch("id");
+
+      // ── Attempt 2: some custom schemas map auth.uid() via "user_id" ──────
+      // A 400 on Attempt 1 means PostgREST rejected the filter — either the
+      // column doesn't exist in this deployment's schema, or an RLS timing
+      // gap prevented the JWT from attaching. Retry with "user_id" before
+      // giving up, so the function is schema-agnostic.
+      if (error) {
+        console.warn(
+          `loadProfile: .eq("id") error [${error.code}] ${error.message} — retrying with "user_id"`
+        );
+        const retry = await attemptFetch("user_id");
+        data  = retry.data;
+        error = retry.error;
+      }
+
+      // ── Final error: log with full code + message for debugging ───────────
+      if (error) {
+        console.error(
+          `loadProfile: both column attempts failed [${error.code}] ${error.message}`
+        );
+        return false;
+      }
+
+      // ── No profile row yet (new account, trigger not yet fired) ──────────
       if (!data) return false;
+
+      // ── Apply profile data to React state ────────────────────────────────
       const lvl = Math.max(0, (data.current_level || 1) - 1);
       const sn  = Math.max(0, (data.current_set   || 1) - 1);
       const premium = data.is_premium || false;
@@ -1726,15 +1763,18 @@ export default function SwaraSlamApp() {
       setLevel(lvl); setSetNum(sn);
       setIsPremium(premium); setHasCompletedLevel1(completedL1);
       isPremiumRef.current = premium;
-      // FIX 3a — do NOT overwrite userRef.current here with a bare UUID string.
-      // Callers (getSession, onAuthStateChange, handleAuthSuccess) set userRef.current
-      // to the full Supabase User object before invoking loadProfile.
-      // Overwriting it with userId (a string) broke userRef.current.id downstream,
-      // causing saveProgress to silently bail at `if (!userRef.current)` every time.
+      // NOTE: do NOT assign userRef.current here — callers already set it to
+      // the full Supabase User object. Overwriting with a bare UUID string
+      // breaks userRef.current.id in saveProgress downstream.
       setHighestBpm(data.last_bpm || data.highest_bpm || BASE_BPM);
       setCards(generateCards(lvl)); setCurrentCards(null);
       return premium;
-    } catch (e) { console.error("loadProfile:", e); return false; }
+
+    } catch (e) {
+      // Network failure or unexpected throw — degrade gracefully
+      console.error("loadProfile: unexpected error:", e);
+      return false;
+    }
   };
 
   const saveProgress = useCallback(async (lvl, sn, curBpm) => {
