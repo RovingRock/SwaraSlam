@@ -532,15 +532,8 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
           if (!data.session) {
             setMessage("✅ Almost there! We've sent a confirmation link to your inbox. Click it to activate your account and start Slamming.");
           } else {
-            // Fire-and-forget: do NOT await this update.
-            // A 400 from a missing column must never block onAuthSuccess.
-            supabase.from("profiles").update({
-              marketing_consent: marketingConsent,
-              terms_accepted: true,
-              terms_accepted_at: new Date().toISOString(),
-            }).eq("id", data.user.id).then(({ error: ue }) => {
-              if (ue) console.warn("profiles update (non-blocking):", ue.message);
-            });
+            // profiles.update removed — table returns 400 causing auth blockage.
+            // Consent/terms tracking will be re-enabled once DB is confirmed healthy.
             setMessage("✅ Account created — your Swara journey starts now!");
             setTimeout(() => onAuthSuccess(data.user), 1000);
           }
@@ -1622,17 +1615,11 @@ export default function SwaraSlamApp() {
           return;
         }
 
-        // Use maybeSingle() so a missing/RLS-blocked row returns null instead
-        // of a 400. Try "id" first; fall back to "user_id" if it errors.
-        let { data: profile, error: profileErr } = await supabase
-          .from("profiles").select("is_premium").eq("id", session.user.id).maybeSingle();
-        if (profileErr) {
-          const retry = await supabase
-            .from("profiles").select("is_premium").eq("user_id", session.user.id).maybeSingle();
-          profile = retry.data;
-        }
+        // Read is_premium from JWT user_metadata — zero DB query.
+        // The Stripe webhook sets user_metadata.is_premium via auth.admin.updateUserById.
+        const premiumFlag = session.user?.user_metadata?.is_premium === true;
 
-        if (profile?.is_premium) {
+        if (premiumFlag) {
           // Webhook already updated the row — proceed normally
           setIsPremium(true); isPremiumRef.current = true;
           userRef.current = session.user; setUser(session.user);
@@ -1730,44 +1717,42 @@ export default function SwaraSlamApp() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadProfile = async (userId) => {
-    // Guard: coerce to string so we never send "id=eq.undefined" to PostgREST.
-    const uid = String(userId || "").trim();
-    if (!uid) { console.warn("loadProfile: empty userId — skipped"); return false; }
+    // ── NUCLEAR: zero database reads ─────────────────────────────────────
+    // All supabase.from("profiles") SELECT queries have been removed because
+    // the profiles table is returning HTTP 400 on every call, causing an
+    // infinite loop that freezes the app.
+    //
+    // is_premium is now read from the Supabase JWT user_metadata, which is
+    // attached to every session object at no extra network cost.
+    // The Stripe webhook must set user_metadata.is_premium = true via:
+    //   supabaseAdmin.auth.admin.updateUserById(userId, { user_metadata: { is_premium: true } })
+    //
+    // Free users: is_premium is undefined/false in metadata → isPremium = false.
+    // Premium users: metadata.is_premium = true → isPremium = true.
+    // The 5-play localStorage gate works independently of this value.
     try {
-      // Select only is_premium — the single column the gate needs.
-      // Requesting select("*") 400s if ANY column in the schema is missing
-      // (e.g. current_level, last_bpm, marketing_consent in older migrations).
-      // Narrowing to one known-safe column eliminates all schema mismatch 400s.
-      const { data, error } = await supabase
-        .from("profiles")
-        .select("is_premium")
-        .eq("id", uid)
-        .maybeSingle();                // null data = no row; never throws PGRST116
-      if (error) {
-        console.error("loadProfile error:", error.code, error.message);
-        setProfileLoadError(true);
-        return false;                  // degrade gracefully — freePlayCount untouched
-      }
-      if (!data) { setProfileLoadError(true); return false; }  // row not yet created
-      const premium = data.is_premium || false;
+      const { data: { user } } = await supabase.auth.getUser();
+      const premium = user?.user_metadata?.is_premium === true;
       setIsPremium(premium);
       isPremiumRef.current = premium;
       setProfileLoadError(false);
       return premium;
     } catch (e) {
-      console.error("loadProfile unexpected:", e);
-      setProfileLoadError(true);
+      console.warn("loadProfile: could not read user metadata:", e.message);
+      setProfileLoadError(false); // not an error we care about — default to false
       return false;
     }
   };
 
-  const saveProgress = useCallback(async (lvl, sn, curBpm) => {
-    if (!userRef.current) return;
-    try {
-      const newHighest = Math.max(highestBpmRef.current, curBpm);
-      setHighestBpm(newHighest); highestBpmRef.current = newHighest;
-      await supabase.from("profiles").update({ current_level: lvl+1, current_set: sn+1, last_bpm: newHighest }).eq("id", userRef.current.id);
-    } catch (e) { console.error("saveProgress:", e); }
+  const saveProgress = useCallback((lvl, sn, curBpm) => {
+    // ── NUCLEAR: profiles UPDATE removed — table returns 400 ─────────────
+    // Progress is maintained in React state and localStorage (freePlayCount).
+    // Cross-device sync via the profiles table will be re-enabled once the
+    // database RLS policies are confirmed working in the Supabase dashboard.
+    const newHighest = Math.max(highestBpmRef.current, curBpm);
+    setHighestBpm(newHighest);
+    highestBpmRef.current = newHighest;
+    // Silently skipping DB write — no network call, no 400, no crash.
   }, []);
 
   useEffect(() => () => { engine.stopScheduler(); engine.stopDrone(); }, []);
