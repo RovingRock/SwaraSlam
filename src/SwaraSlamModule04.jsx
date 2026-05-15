@@ -1727,6 +1727,14 @@ export default function SwaraSlamApp() {
         }
       });
     }
+    // Clear stale play counter on fresh email confirmation.
+    // A newly confirmed user always starts with 0 free plays regardless
+    // of any leftover localStorage from previous test sessions on this device.
+    if (hash.includes("type=signup")) {
+      localStorage.removeItem('swaraslam_free_plays');
+      setFreePlayCount(0); freePlayCountRef.current = 0;
+      window.history.replaceState({}, "", window.location.pathname);
+    }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadProfile = async (userId) => {
