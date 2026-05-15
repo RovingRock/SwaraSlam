@@ -1576,84 +1576,90 @@ export default function SwaraSlamApp() {
     const params = new URLSearchParams(window.location.search);
     if (params.get("success") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
-      let attempts = 0;
-      const maxAttempts = 8; // increased from 5 — gives webhook more time
+      // Show verifying screen immediately — user must not see paywall while polling
+      setScreen("verifying");
+      hasFetchedProfile.current = true; // prevent onAuthStateChange from interrupting
 
-      // ── PAYMENT FIX: forcePremiumUpdate ───────────────────────────────────
-      // Last-resort fallback when the Stripe webhook has not updated the profiles
-      // row within the polling window. Uses supabaseAdmin (service role) to bypass
-      // RLS — the anon client write silently fails on most RLS configurations that
-      // correctly restrict is_premium to service-role-only updates (Fix 3d).
+      let attempts = 0;
+      const maxAttempts = 20;      // 20 × 2s = 40s window — plenty for webhook
+      const POLL_INTERVAL = 2000;  // fixed 2s — fast enough, not hammering
+
+      // Activate premium in React state and clear the localStorage gate
+      const activatePremium = (sessionUser) => {
+        setIsPremium(true); isPremiumRef.current = true;
+        userRef.current = sessionUser; setUser(sessionUser);
+        setFreePlayCount(0); freePlayCountRef.current = 0;
+        localStorage.removeItem('swaraslam_free_plays');
+        setConfetti(true); setTimeout(() => setConfetti(false), 3500);
+        setScreen("premium-unlocked");
+        setTimeout(() => setScreen("game"), 3500);
+      };
+
+      // Force-write premium via service role if webhook timed out
       const forcePremiumUpdate = async (userId) => {
         try {
-          // Update profiles table
           await supabaseAdmin.from("profiles")
             .update({ is_premium: true })
             .eq("id", userId);
-          // Also set user_metadata so refreshSession() returns the flag in JWT
-          const { error } = await supabaseAdmin.auth.admin.updateUserById(
-            userId,
-            { user_metadata: { is_premium: true } }
+          await supabaseAdmin.auth.admin.updateUserById(
+            userId, { user_metadata: { is_premium: true } }
           );
-          if (error) throw error;
-          console.log("forcePremiumUpdate: profiles + user_metadata updated.");
-        } catch (e) {
-          console.error("forcePremiumUpdate failed:", e);
-        }
+          console.log("forcePremiumUpdate: service role write complete.");
+        } catch (e) { console.error("forcePremiumUpdate failed:", e); }
       };
 
       const checkPremiumStatus = async () => {
         attempts++;
-        // FIX 3b — use refreshSession() instead of getSession().
-        // getSession() reads from localStorage which may be null/stale if the
-        // supabaseAdmin client previously wrote to the same storage key (now
-        // fixed by Fix 1a, but defensive here regardless). refreshSession()
-        // always makes a live network call to the Supabase auth server, so it
-        // returns a valid session even if the local cache is corrupt.
-        // If the session is still null (e.g. user cleared storage mid-flow),
-        // retry rather than silently exit — the user just paid.
-        const { data: refreshData } = await supabase.auth.refreshSession();
-        const session = refreshData?.session;
-        if (!session?.user) {
-          // Session temporarily unavailable — keep retrying until maxAttempts
-          if (attempts < maxAttempts) {
-            setTimeout(checkPremiumStatus, 1000 * Math.pow(2, attempts - 1));
-          }
+        console.log(\`[SwaraSlam] premium poll attempt \${attempts}/\${maxAttempts}\`);
+
+        // Step 1: get current session (fast — reads local cache)
+        const { data: { session } } = await supabase.auth.getSession();
+        const userId = session?.user?.id;
+        if (!userId) {
+          // No session yet — keep waiting
+          if (attempts < maxAttempts) setTimeout(checkPremiumStatus, POLL_INTERVAL);
+          else setScreen("paywall"); // give up
           return;
         }
 
-        // Read is_premium from JWT user_metadata — zero DB query.
-        // The Stripe webhook sets user_metadata.is_premium via auth.admin.updateUserById.
-        const premiumFlag = session.user?.user_metadata?.is_premium === true;
+        // Step 2: query profiles table directly — the ground truth the webhook writes to.
+        // This bypasses JWT caching entirely. refreshSession() won't return updated
+        // user_metadata until the token naturally expires, so we can't rely on it.
+        const { data: profile } = await supabaseAdmin
+          .from("profiles")
+          .select("is_premium")
+          .eq("id", userId)
+          .maybeSingle();
 
-        if (premiumFlag) {
-          // Webhook already updated the row — proceed normally
-          setIsPremium(true); isPremiumRef.current = true;
-          userRef.current = session.user; setUser(session.user);
-          setFreePlayCount(0); freePlayCountRef.current = 0;
-          localStorage.removeItem('swaraslam_free_plays'); // lift the gate permanently
-          setConfetti(true); setTimeout(() => setConfetti(false), 3500);
-          setScreen("premium-unlocked");
-          setTimeout(() => setScreen("game"), 3500);
-        } else if (attempts < maxAttempts) {
-          // FIX 3c — true exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s…
-          // Previous code used `1000 * attempts` (linear). With 8 attempts that
-          // exhausted the window in 36s total. Exponential gives 255s (4+ min),
-          // which comfortably covers most Stripe webhook delivery delays.
-          setTimeout(checkPremiumStatus, 1000 * Math.pow(2, attempts - 1));
+        if (profile?.is_premium === true) {
+          // Webhook has fired and profiles row is updated — activate immediately
+          console.log("[SwaraSlam] premium confirmed via profiles table");
+          // Force a session refresh so the JWT also carries the flag going forward
+          await supabase.auth.refreshSession();
+          const { data: { session: freshSession } } = await supabase.auth.getSession();
+          activatePremium(freshSession?.user || session.user);
+          return;
+        }
+
+        // Also check user_metadata in case webhook used updateUserById directly
+        const metaFlag = session.user?.user_metadata?.is_premium === true;
+        if (metaFlag) {
+          console.log("[SwaraSlam] premium confirmed via user_metadata");
+          activatePremium(session.user);
+          return;
+        }
+
+        if (attempts < maxAttempts) {
+          setTimeout(checkPremiumStatus, POLL_INTERVAL);
         } else {
-          // Webhook timed out — force-update the profile row, then proceed
-          await forcePremiumUpdate(session.user.id);
-          setIsPremium(true); isPremiumRef.current = true;
-          userRef.current = session.user; setUser(session.user);
-          setFreePlayCount(0); freePlayCountRef.current = 0;
-          localStorage.removeItem('swaraslam_free_plays'); // lift the gate permanently
-          setConfetti(true); setTimeout(() => setConfetti(false), 3500);
-          setScreen("premium-unlocked");
-          setTimeout(() => setScreen("game"), 3500);
+          // Webhook timed out entirely — force-write and unlock anyway
+          console.warn("[SwaraSlam] webhook timeout — forcing premium via service role");
+          await forcePremiumUpdate(userId);
+          activatePremium(session.user);
         }
       };
-      setTimeout(checkPremiumStatus, 1000);
+
+      setTimeout(checkPremiumStatus, 1500); // 1.5s head start for webhook
       return;
     }
 
@@ -2466,6 +2472,27 @@ export default function SwaraSlamApp() {
             onOpenLegal={() => setShowLegalModal(true)}
             preferredMode={authMode}
           />
+        </div>
+      )}
+
+      {/* VERIFYING — shown while post-payment premium polling runs */}
+      {screen === "verifying" && (
+        <div className="screen" style={{gap:24,textAlign:"center"}}>
+          <div style={{fontSize:52}}>🎵</div>
+          <div className="ready-title" style={{fontSize:"clamp(22px,5vw,32px)"}}>
+            Verifying your Riyaz Pass…
+          </div>
+          <p className="ready-sub" style={{maxWidth:320,lineHeight:1.7}}>
+            Your payment is being confirmed. Please do not close this window.
+          </p>
+          <div style={{display:"flex",gap:8,justifyContent:"center",marginTop:8}}>
+            {[0,1,2].map(i => (
+              <div key={i} style={{
+                width:10,height:10,borderRadius:"50%",background:"#C05F2F",
+                animation:`micPulse 1.4s ease-in-out ${i*0.25}s infinite`
+              }}/>
+            ))}
+          </div>
         </div>
       )}
 
