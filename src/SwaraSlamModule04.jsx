@@ -1507,6 +1507,13 @@ export default function SwaraSlamApp() {
   const bpmRef        = useRef(bpm);
   const highestBpmRef = useRef(highestBpm);
   const engine        = useAudioEngine();
+  // ── Profile fetch lock — prevents infinite loop ───────────────────────
+  // onAuthStateChange fires on every auth event including token refreshes
+  // triggered by checkPremiumStatus. Without this lock, each refreshSession()
+  // call emits SIGNED_IN → loadProfile → error → re-render → repeat.
+  // hasFetchedProfile gates loadProfile to exactly one call per session.
+  // Reset to false on logout so the next login gets a fresh fetch.
+  const hasFetchedProfile = useRef(false);
 
   saIdxRef.current = saIndex; cardsRef.current = cards; levelRef.current = level;
   setNumRef.current = setNum; userRef.current = user; isPremiumRef.current = isPremium;
@@ -1663,7 +1670,8 @@ export default function SwaraSlamApp() {
     // ── 2. Restore persisted session on mount ─────────────────────────────
     supabase.auth.getSession().then(({ data: { session }, error }) => {
       if (error) { console.warn("Session restore error:", error.message); return; }
-      if (session?.user) {
+      if (session?.user && !hasFetchedProfile.current) {
+        hasFetchedProfile.current = true;          // lock: one fetch per session
         setUser(session.user);
         userRef.current = session.user;
         loadProfile(session.user.id).then(() => {
@@ -1674,12 +1682,14 @@ export default function SwaraSlamApp() {
 
     // ── 3. Auth state change listener ────────────────────────────────────
     // FIX 1b — Email confirmation gate.
-    // onAuthStateChange fires SIGNED_IN for both confirmed and unconfirmed
-    // users (e.g. right after signUp when email confirm is ON, Supabase still
-    // fires SIGNED_IN but email_confirmed_at is null). We must NOT advance
-    // screen state for unconfirmed accounts — the user should see the
-    // "check your inbox" message in AuthModal until they click the link.
-    // PASSWORD_RECOVERY is exempt (confirmed status irrelevant for resets).
+    // onAuthStateChange fires SIGNED_IN for every auth event including token
+    // refreshes from checkPremiumStatus. Without hasFetchedProfile, each
+    // refreshSession() call triggers SIGNED_IN → loadProfile → 400 error →
+    // setProfileLoadError(true) → re-render → another SIGNED_IN → infinite loop.
+    // The hasFetchedProfile lock breaks this cycle: loadProfile is called exactly
+    // once per session regardless of how many SIGNED_IN events fire.
+    // Unconfirmed accounts are still blocked (email_confirmed_at guard).
+    // PASSWORD_RECOVERY is exempt — it routes to reset-password, not loadProfile.
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === "PASSWORD_RECOVERY" && session?.user) {
         setUser(session.user); userRef.current = session.user;
@@ -1687,13 +1697,18 @@ export default function SwaraSlamApp() {
         return;
       }
       if (session?.user) {
-        // Only update app state for confirmed accounts.
-        // Unconfirmed users get the confirmation prompt in AuthModal;
-        // advancing them here would bypass the email verification flow.
-        if (!session.user.email_confirmed_at) return;
+        if (!session.user.email_confirmed_at) return;  // unconfirmed — block
         setUser(session.user); userRef.current = session.user;
-        loadProfile(session.user.id);
+        // Only call loadProfile if we haven't already fetched for this session.
+        // This prevents the infinite loop: refreshSession() → SIGNED_IN → loadProfile
+        // → error → re-render → refreshSession() → SIGNED_IN → ...
+        if (!hasFetchedProfile.current) {
+          hasFetchedProfile.current = true;
+          loadProfile(session.user.id);
+        }
       } else {
+        // SIGNED_OUT — reset lock so next login gets a fresh fetch
+        hasFetchedProfile.current = false;
         setUser(null); userRef.current = null;
         setIsPremium(false); isPremiumRef.current = false;
       }
@@ -1956,11 +1971,13 @@ export default function SwaraSlamApp() {
     setMicActive(false); setLevelSummaryData(null);
     setFreePlayCount(0); freePlayCountRef.current = 0;
     localStorage.removeItem('swaraslam_free_plays'); // clear gate on logout
+    hasFetchedProfile.current = false;              // reset lock for next login
     setScreen("home");
   }, [stopPlay]);
 
   const handleAuthSuccess = useCallback(async (loggedInUser) => {
     setUser(loggedInUser); userRef.current = loggedInUser;
+    hasFetchedProfile.current = true;  // prevent duplicate call from onAuthStateChange
     await loadProfile(loggedInUser.id);
     setScreen("ready");
   }, []);
@@ -1969,6 +1986,7 @@ export default function SwaraSlamApp() {
     const { data: { session } } = await supabase.auth.getSession();
     if (session?.user) {
       setUser(session.user); userRef.current = session.user;
+      hasFetchedProfile.current = true;  // prevent duplicate call from onAuthStateChange
       await loadProfile(session.user.id);
     }
     setScreen("ready");
