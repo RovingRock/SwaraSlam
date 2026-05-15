@@ -1043,19 +1043,20 @@ function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
   const btnBase = { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"13px 24px",color:"#fff",border:"none",borderRadius:8,cursor:redirecting?"not-allowed":"pointer",width:"100%" };
   const isRedirecting = (priceId) => redirecting && redirectingPriceId === priceId;
 
-  // HARD OVERRIDE: localStorage is the odometer — profile state is ignored.
-  // If localStorage says >= 5, force locked copy instantly regardless of
-  // whether the Supabase profiles query succeeded, failed, or hasn't run yet.
-  const localPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
-  const subtitleText = localPlays >= 5
+  // Reads localStorage at render time — always the live count, never stale.
+  const actualPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+  const piecesRemaining = Math.max(0, 5 - actualPlays);
+  const dynamicSubtitle = actualPlays >= 5
     ? "You've mastered your first 5 sets! To continue your Riyaz and unlock all 4 levels, choose a plan below."
-    : `You have [${Math.max(0, 5 - localPlays)}] Free slam${Math.max(0, 5 - localPlays) === 1 ? "" : "s"} remaining. To continue Swara slamming and unlock all levels, choose a plan below.`;
+    : actualPlays > 0
+      ? `You have [${piecesRemaining}] Free slam${piecesRemaining === 1 ? "" : "s"} remaining. To continue Swara slamming and unlock all levels, choose a plan below.`
+      : "Level 1 is free. Unlock chromatic swaras, advanced jumps, and three octaves with full access.";
 
   return (
     <div style={{width:"100%",maxWidth:480,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",gap:20,padding:"32px 16px"}}>
       <div style={{fontSize:44}}>🔒</div>
       <h2 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,color:"#1C1A17",margin:0,textAlign:"center"}}>Unlock All 4 Levels</h2>
-      <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>{subtitleText}</p>
+      <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>{dynamicSubtitle}</p>
       <div style={{display:"flex",gap:16,flexWrap:"wrap",justifyContent:"center",width:"100%",marginTop:8}}>
         <div style={{background:"#fff",border:"1.5px solid #E5DFD3",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center"}}>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>24-HOUR PASS</div>
