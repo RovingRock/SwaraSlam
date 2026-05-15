@@ -1,20 +1,47 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createClient } from "@supabase/supabase-js";
 
-// ─── Supabase ─────────────────────────────────────────────────────────────────
+// ─── Supabase (anon — used for all user-facing operations) ────────────────────
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
   import.meta.env.VITE_SUPABASE_ANON_KEY
+);
+
+// ─── Supabase Admin (service role — used ONLY for AdminDashboard reads) ───────
+// IMPORTANT: VITE_SUPABASE_SERVICE_ROLE_KEY must be set in your .env file.
+// This key bypasses RLS. Never expose it to end users.
+// The AdminDashboard component is only reachable via ?admin=true in the URL.
+//
+// FIX 1a — storageKey isolation:
+// Two createClient() calls against the same project URL share the same
+// localStorage key ("sb-<ref>-auth-token") by default in supabase-js v2.
+// The service-role client has no user session; without isolation it can
+// overwrite the anon client's stored JWT with null on initialisation,
+// silently invalidating auth and breaking confirmation email flows.
+// Setting a unique storageKey keeps the two clients' token storage separate.
+const supabaseAdmin = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: {
+      persistSession:    false,   // service-role client never needs a persisted session
+      autoRefreshToken:  false,   // no token to refresh
+      detectSessionInUrl: false,  // don't let it intercept auth callback URLs
+      storageKey: "sb-admin-auth-token", // isolated key — never conflicts with anon client
+    },
+  }
 );
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ─── usePitchDetection Hook ───────────────────────────────────────────────────
 // RULE #2: Fully encapsulated. No game state is read or written from inside.
 // Accepts: isActive (bool), targetFreq (number)
-// Returns: isMatch (bool)
+// Returns: isMatch (bool), micError (string|null), retryMic (fn)
 // ═══════════════════════════════════════════════════════════════════════════════
 function usePitchDetection({ isActive, targetFreq }) {
-  const [isMatch, setIsMatch] = useState(false);
+  const [isMatch,  setIsMatch]  = useState(false);
+  // ── NEW: micError holds a human-readable error string, or null if OK ──────
+  const [micError, setMicError] = useState(null);
 
   const audioCtxRef    = useRef(null);
   const analyserRef    = useRef(null);
@@ -29,25 +56,21 @@ function usePitchDetection({ isActive, targetFreq }) {
   targetFreqRef.current = targetFreq;
 
   // ── Autocorrelation pitch detection ────────────────────────────────────────
-  // Classic McLeod / YIN-adjacent approach using Web Audio AnalyserNode buffer.
   const detectPitch = useCallback((analyser, sampleRate) => {
     const buffer = bufferRef.current;
     analyser.getFloatTimeDomainData(buffer);
 
-    // RMS silence gate — skip if signal too quiet (< -60 dBFS ≈ 0.001)
     let rms = 0;
     for (let i = 0; i < buffer.length; i++) rms += buffer[i] * buffer[i];
     rms = Math.sqrt(rms / buffer.length);
     if (rms < 0.012) return null;
 
-    // Autocorrelation
     const n = buffer.length;
     let bestOffset = -1;
     let bestCorr   = 0;
     let lastCorr   = 1;
     let foundGo    = false;
 
-    // Search range: 50 Hz – 1200 Hz covers all vocal ranges + upper swaras
     const minOffset = Math.floor(sampleRate / 1200);
     const maxOffset = Math.ceil(sampleRate / 50);
 
@@ -58,15 +81,9 @@ function usePitchDetection({ isActive, targetFreq }) {
       }
       corr = 1 - corr / (n - offset);
 
-      if (corr > 0.9 && corr > lastCorr) {
-        foundGo = true;
-      }
+      if (corr > 0.9 && corr > lastCorr) foundGo = true;
       if (foundGo && corr < lastCorr) {
-        // Local peak found
-        if (corr > bestCorr) {
-          bestCorr   = corr;
-          bestOffset = offset - 1;
-        }
+        if (corr > bestCorr) { bestCorr = corr; bestOffset = offset - 1; }
         foundGo = false;
       }
       lastCorr = corr;
@@ -74,8 +91,6 @@ function usePitchDetection({ isActive, targetFreq }) {
 
     if (bestOffset === -1 || bestCorr < 0.92) return null;
 
-    // Parabolic interpolation for sub-sample accuracy
-    // Compute normalised correlation at a given offset
     const corrAt = (offset) => {
       let c = 0;
       const len = n - offset;
@@ -89,123 +104,376 @@ function usePitchDetection({ isActive, targetFreq }) {
 
     const denom = 2 * (2 * curr - next - prev);
     const shift = denom !== 0 ? (next - prev) / denom : 0;
-    const refinedOffset = bestOffset + shift;
-
-    return sampleRate / refinedOffset;
+    return sampleRate / (bestOffset + shift);
   }, []);
 
-  // ── Frequency → Cents deviation from target ────────────────────────────────
   const freqToCents = (detected, target) => {
     if (!detected || !target || detected <= 0 || target <= 0) return Infinity;
     return 1200 * Math.log2(detected / target);
   };
 
-  // ── Check match across all octaves of the target swara ────────────────────
-  // A singer may produce the swara in mandra (lower) or taar (upper) saptak.
   const checkMatchAcrossOctaves = useCallback((detectedHz, targetHz) => {
     if (!detectedHz || !targetHz) return false;
-    // Check target octave, one below, one above
     for (const mult of [0.5, 1, 2]) {
-      const octaveTarget = targetHz * mult;
-      const cents = Math.abs(freqToCents(detectedHz, octaveTarget));
-      if (cents <= 25) return true;   // ±25 cents tolerance as specified
+      if (Math.abs(freqToCents(detectedHz, targetHz * mult)) <= 25) return true;
     }
     return false;
   }, []);
 
-  // ── Detection loop ─────────────────────────────────────────────────────────
   const startLoop = useCallback(() => {
     const analyser   = analyserRef.current;
     const sampleRate = audioCtxRef.current?.sampleRate ?? 44100;
-
     const loop = () => {
-      if (!isActiveRef.current) {
-        setIsMatch(false);
-        return;
-      }
+      if (!isActiveRef.current) { setIsMatch(false); return; }
       rafRef.current = requestAnimationFrame(loop);
-
       const hz = detectPitch(analyser, sampleRate);
-      const matched = checkMatchAcrossOctaves(hz, targetFreqRef.current);
-      setIsMatch(matched);
+      setIsMatch(checkMatchAcrossOctaves(hz, targetFreqRef.current));
     };
-
     rafRef.current = requestAnimationFrame(loop);
   }, [detectPitch, checkMatchAcrossOctaves]);
 
-  // ── Teardown helper ────────────────────────────────────────────────────────
   const teardown = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
     setIsMatch(false);
-
-    try { sourceRef.current?.disconnect(); } catch (e) {}
+    try { sourceRef.current?.disconnect(); }  catch (e) {}
     try { analyserRef.current?.disconnect(); } catch (e) {}
-
-    // Stop all mic tracks — removes browser "mic in use" indicator
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
     sourceRef.current = null;
     analyserRef.current = null;
-
     try { audioCtxRef.current?.close(); } catch (e) {}
     audioCtxRef.current = null;
     bufferRef.current = null;
   }, []);
 
+  // ── NEW: acquireMic — extracted so retryMic can call it independently ──────
+  const acquireMic = useCallback(async () => {
+    setMicError(null); // clear any previous error
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      return stream;
+    } catch (err) {
+      // Map DOMException names to friendly messages
+      let msg = "Microphone unavailable. Scoring is disabled.";
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        msg = "Microphone access was denied. Tap Retry to grant permission, or check your browser settings.";
+      } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+        msg = "No microphone found. Connect a mic and tap Retry.";
+      } else if (err.name === "NotReadableError" || err.name === "TrackStartError") {
+        msg = "Microphone is in use by another app. Close it and tap Retry.";
+      }
+      console.warn("usePitchDetection:", err.name, err.message);
+      setMicError(msg);
+      setIsMatch(false);
+      return null;
+    }
+  }, []);
+
   // ── Main effect: start / stop based on isActive ───────────────────────────
   useEffect(() => {
-    if (!isActive) {
-      teardown();
-      return;
-    }
+    if (!isActive) { teardown(); return; }
 
     let cancelled = false;
-
     (async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        });
-        if (cancelled) { stream.getTracks().forEach(t => t.stop()); return; }
-
-        streamRef.current = stream;
-
-        const ctx      = new (window.AudioContext || window.webkitAudioContext)();
-        audioCtxRef.current = ctx;
-        if (ctx.state === "suspended") await ctx.resume();
-
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize          = 2048;
-        analyser.smoothingTimeConstant = 0.0; // No smoothing for pitch accuracy
-        analyserRef.current = analyser;
-        bufferRef.current = new Float32Array(analyser.fftSize);
-
-        const source = ctx.createMediaStreamSource(stream);
-        source.connect(analyser);
-        // NOTE: Do NOT connect to ctx.destination — avoids mic feedback
-        sourceRef.current = source;
-
-        startLoop();
-      } catch (err) {
-        // Mic permission denied or hardware unavailable — fail silently
-        console.warn("usePitchDetection: mic unavailable:", err.message);
-        setIsMatch(false);
+      const stream = await acquireMic();
+      if (!stream || cancelled) {
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        return;
       }
+
+      streamRef.current = stream;
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtxRef.current = ctx;
+      if (ctx.state === "suspended") await ctx.resume();
+
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.0;
+      analyserRef.current = analyser;
+      bufferRef.current = new Float32Array(analyser.fftSize);
+
+      const source = ctx.createMediaStreamSource(stream);
+      source.connect(analyser);
+      sourceRef.current = source;
+
+      startLoop();
     })();
 
-    return () => {
-      cancelled = true;
-      teardown();
-    };
+    return () => { cancelled = true; teardown(); };
   }, [isActive]); // eslint-disable-line react-hooks/exhaustive-deps
-  // targetFreq changes are handled via ref — no need to restart AudioContext
 
-  return { isMatch };
+  // ── NEW: retryMic — lets the user re-request permission after denial ───────
+  // Tears down any stale audio context, clears the error, and re-acquires.
+  const retryMic = useCallback(async () => {
+    teardown();
+    if (!isActiveRef.current) return;
+
+    const stream = await acquireMic();
+    if (!stream) return; // acquireMic already set micError
+
+    streamRef.current = stream;
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    audioCtxRef.current = ctx;
+    if (ctx.state === "suspended") await ctx.resume();
+
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.0;
+    analyserRef.current = analyser;
+    bufferRef.current = new Float32Array(analyser.fftSize);
+
+    const source = ctx.createMediaStreamSource(stream);
+    source.connect(analyser);
+    sourceRef.current = source;
+
+    startLoop();
+  }, [teardown, acquireMic, startLoop]);
+
+  return { isMatch, micError, retryMic };
+}
+
+// ─── MicErrorBanner ───────────────────────────────────────────────────────────
+// Shown inside the game UI when usePitchDetection reports a mic error.
+// Dismissible via the × button; has a Retry button that calls retryMic().
+function MicErrorBanner({ message, onRetry, onDismiss }) {
+  return (
+    <div style={{
+      width: "100%",
+      maxWidth: 480,
+      backgroundColor: "rgba(192,95,47,0.08)",
+      border: "1px solid rgba(192,95,47,0.28)",
+      borderRadius: 10,
+      padding: "10px 14px",
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+      fontFamily: "'DM Sans',sans-serif",
+      fontSize: 12,
+      color: "#7A3A18",
+      lineHeight: 1.5,
+    }}>
+      {/* Warning icon */}
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#C05F2F"
+        strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{flexShrink:0}}>
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+        <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+      </svg>
+
+      <span style={{flex:1}}>{message}</span>
+
+      {/* Retry button */}
+      <button
+        onClick={onRetry}
+        style={{
+          flexShrink: 0,
+          fontFamily: "'DM Sans',sans-serif",
+          fontSize: 11,
+          fontWeight: 600,
+          color: "#C05F2F",
+          background: "none",
+          border: "1.5px solid rgba(192,95,47,0.4)",
+          borderRadius: 6,
+          padding: "4px 10px",
+          cursor: "pointer",
+          letterSpacing: ".04em",
+          whiteSpace: "nowrap",
+        }}
+      >
+        Retry
+      </button>
+
+      {/* Dismiss × */}
+      <button
+        onClick={onDismiss}
+        aria-label="Dismiss"
+        style={{
+          flexShrink: 0,
+          background: "none",
+          border: "none",
+          cursor: "pointer",
+          color: "rgba(192,95,47,0.5)",
+          padding: 2,
+          lineHeight: 0,
+        }}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+          <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+        </svg>
+      </button>
+    </div>
+  );
+}
+
+// ─── AdminDashboard ───────────────────────────────────────────────────────────
+// Protected admin view. Only rendered when showAdmin === true (set via ?admin=true URL param).
+// Uses supabaseAdmin (service role) to bypass RLS and read all feedback rows.
+// Status updates also use supabaseAdmin so they succeed regardless of user auth state.
+function AdminDashboard({ onClose }) {
+  const [rows,       setRows]       = useState([]);
+  const [loading,    setLoading]    = useState(true);
+  const [error,      setError]      = useState("");
+  const [filter,     setFilter]     = useState("all"); // "all" | "new" | "reviewed" | "archived"
+  const [updating,   setUpdating]   = useState(null);  // row id being updated
+
+  const STATUS_OPTIONS = ["new", "reviewed", "archived"];
+
+  const fetchFeedback = useCallback(async () => {
+    setLoading(true); setError("");
+    try {
+      let q = supabaseAdmin
+        .from("feedback")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (filter !== "all") q = q.eq("status", filter);
+      const { data, error: err } = await q;
+      if (err) throw err;
+      setRows(data || []);
+    } catch (e) {
+      setError("Failed to load feedback: " + (e.message || String(e)));
+    } finally {
+      setLoading(false);
+    }
+  }, [filter]);
+
+  useEffect(() => { fetchFeedback(); }, [fetchFeedback]);
+
+  const handleStatusChange = async (id, newStatus) => {
+    setUpdating(id);
+    try {
+      const { error: err } = await supabaseAdmin
+        .from("feedback")
+        .update({ status: newStatus })
+        .eq("id", id);
+      if (err) throw err;
+      setRows(prev => prev.map(r => r.id === id ? { ...r, status: newStatus } : r));
+    } catch (e) {
+      alert("Status update failed: " + e.message);
+    } finally {
+      setUpdating(null);
+    }
+  };
+
+  const s = {
+    overlay:  { position:"fixed",inset:0,backgroundColor:"rgba(28,26,23,0.92)",zIndex:999999,overflowY:"auto",fontFamily:"'DM Sans',sans-serif" },
+    container:{ maxWidth:860,margin:"0 auto",padding:"32px 24px 48px" },
+    header:   { display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:28,borderBottom:"1px solid rgba(255,255,255,.1)",paddingBottom:20 },
+    title:    { fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,color:"#F9F7F2",margin:0 },
+    sub:      { fontSize:12,color:"rgba(249,247,242,.45)",letterSpacing:".1em",marginTop:4 },
+    closeBtn: { background:"rgba(255,255,255,.08)",border:"1px solid rgba(255,255,255,.12)",color:"#F9F7F2",width:36,height:36,borderRadius:"50%",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 },
+    filterRow:{ display:"flex",gap:8,marginBottom:20,flexWrap:"wrap" },
+    filterBtn:{ fontFamily:"'DM Sans',sans-serif",fontSize:12,fontWeight:500,padding:"6px 16px",borderRadius:99,cursor:"pointer",transition:"background .15s,color .15s,border-color .15s",letterSpacing:".04em" },
+    table:    { width:"100%",borderCollapse:"collapse" },
+    th:       { fontFamily:"'DM Sans',sans-serif",fontSize:10,fontWeight:600,letterSpacing:".14em",textTransform:"uppercase",color:"rgba(154,123,80,1)",padding:"8px 12px",textAlign:"left",borderBottom:"1px solid rgba(255,255,255,.08)" },
+    td:       { fontSize:13,color:"rgba(249,247,242,.8)",padding:"12px 12px",borderBottom:"1px solid rgba(255,255,255,.05)",verticalAlign:"top",lineHeight:1.55 },
+    statusSel:{ fontFamily:"'DM Sans',sans-serif",fontSize:12,padding:"4px 8px",borderRadius:6,border:"1px solid rgba(255,255,255,.15)",background:"rgba(255,255,255,.06)",color:"#F9F7F2",cursor:"pointer",outline:"none" },
+    badge:    { display:"inline-block",fontSize:10,fontWeight:600,letterSpacing:".1em",padding:"2px 8px",borderRadius:99,textTransform:"uppercase" },
+    emptyMsg: { textAlign:"center",color:"rgba(249,247,242,.35)",padding:"40px 0",fontSize:14 },
+  };
+
+  const badgeStyle = (status) => {
+    if (status === "new")      return { background:"rgba(192,95,47,.2)",color:"#E07040" };
+    if (status === "reviewed") return { background:"rgba(46,125,50,.18)",color:"#4CAF50" };
+    if (status === "archived") return { background:"rgba(255,255,255,.08)",color:"rgba(249,247,242,.4)" };
+    return {};
+  };
+
+  const filterStyle = (f) => filter === f
+    ? { background:"#9A7B50",color:"#fff",border:"1px solid #9A7B50" }
+    : { background:"rgba(255,255,255,.05)",color:"rgba(249,247,242,.55)",border:"1px solid rgba(255,255,255,.12)" };
+
+  const fmt = (iso) => {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    return d.toLocaleDateString("en-SG", { day:"numeric",month:"short",year:"2-digit" })
+      + " " + d.toLocaleTimeString("en-SG", { hour:"2-digit",minute:"2-digit",hour12:false });
+  };
+
+  return (
+    <div style={s.overlay}>
+      <div style={s.container}>
+        {/* Header */}
+        <div style={s.header}>
+          <div>
+            <h1 style={s.title}>🔑 Feedback Admin</h1>
+            <p style={s.sub}>Swara Slam · {rows.length} row{rows.length !== 1 ? "s" : ""} shown</p>
+          </div>
+          <div style={{display:"flex",gap:10,alignItems:"center"}}>
+            <button style={{...s.closeBtn,width:"auto",borderRadius:8,padding:"8px 16px",fontSize:12,fontWeight:600}}
+              onClick={fetchFeedback}>↻ Refresh</button>
+            <button style={s.closeBtn} onClick={onClose} aria-label="Close admin">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                <path d="M18 6L6 18M6 6l12 12" stroke="#F9F7F2" strokeWidth="2" strokeLinecap="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Filter row */}
+        <div style={s.filterRow}>
+          {["all", ...STATUS_OPTIONS].map(f => (
+            <button key={f} style={{...s.filterBtn,...filterStyle(f)}} onClick={() => setFilter(f)}>
+              {f === "all" ? "All" : f.charAt(0).toUpperCase() + f.slice(1)}
+            </button>
+          ))}
+        </div>
+
+        {/* Loading / error / empty */}
+        {loading && <p style={s.emptyMsg}>Loading…</p>}
+        {!loading && error && <p style={{...s.emptyMsg,color:"#E07040"}}>{error}</p>}
+        {!loading && !error && rows.length === 0 && (
+          <p style={s.emptyMsg}>No feedback found{filter !== "all" ? ` with status "${filter}"` : ""}.</p>
+        )}
+
+        {/* Table */}
+        {!loading && !error && rows.length > 0 && (
+          <table style={s.table}>
+            <thead>
+              <tr>
+                <th style={s.th}>Date</th>
+                <th style={s.th}>User</th>
+                <th style={s.th}>Feedback</th>
+                <th style={{...s.th,width:130}}>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(row => (
+                <tr key={row.id}>
+                  <td style={{...s.td,whiteSpace:"nowrap",color:"rgba(249,247,242,.4)",fontSize:11}}>{fmt(row.created_at)}</td>
+                  <td style={{...s.td,maxWidth:160,wordBreak:"break-all",fontSize:12,color:"rgba(154,123,80,1)"}}>
+                    {row.user_email || "anon"}
+                  </td>
+                  <td style={s.td}>{row.feedback_text}</td>
+                  <td style={s.td}>
+                    {/* Badge for quick read */}
+                    <span style={{...s.badge,...badgeStyle(row.status || "new"),marginBottom:6,display:"block",width:"fit-content"}}>
+                      {row.status || "new"}
+                    </span>
+                    {/* Dropdown to change status */}
+                    <select
+                      style={{...s.statusSel, opacity: updating === row.id ? 0.5 : 1}}
+                      value={row.status || "new"}
+                      disabled={updating === row.id}
+                      onChange={e => handleStatusChange(row.id, e.target.value)}
+                    >
+                      {STATUS_OPTIONS.map(opt => (
+                        <option key={opt} value={opt}>{opt.charAt(0).toUpperCase() + opt.slice(1)}</option>
+                      ))}
+                    </select>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ─── Auth Modal ───────────────────────────────────────────────────────────────
-// mode: "signup" | "login" | "forgot" | "forgot-sent"
 function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signup" }) {
   const [mode, setMode]                   = useState(preferredMode);
   const [email, setEmail]                 = useState("");
@@ -217,8 +485,6 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
   const [message, setMessage]             = useState("");
   const [honeypot, setHoneypot]           = useState("");
 
-  // ── Friendly error mapper ────────────────────────────────────────────────
-  // Translates raw Supabase/network errors into plain human language.
   const friendlyError = (err) => {
     const msg = err?.message ?? String(err);
     if (msg.includes("rate limit") || msg.includes("too many") || msg.includes("429"))
@@ -231,14 +497,12 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
       return "Please confirm your email first — check your inbox for the activation link.";
     if (msg.includes("network") || msg.includes("fetch"))
       return "Connection issue — check your internet and try again.";
-    // Fallback: show raw but still strip Supabase boilerplate
     return msg.replace(/^AuthApiError:\s*/i, "");
   };
 
-  // ── Sign up / Log in ─────────────────────────────────────────────────────
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (honeypot) return; // bot trap
+    if (honeypot) return;
     if (mode === "signup" && !termsAccepted) {
       setError("Please accept the Terms & Conditions to continue.");
       return;
@@ -247,36 +511,20 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
     try {
       if (mode === "signup") {
         const { data, error: err } = await supabase.auth.signUp({
-          email,
-          password,
-          options: {
-            emailRedirectTo: "https://swara-slam.vercel.app",
-            data: { marketing_consent: marketingConsent }
-          }
+          email, password,
+          options: { emailRedirectTo: "https://swara-slam.vercel.app", data: { marketing_consent: marketingConsent } }
         });
         if (err) {
-          // Duplicate account — friendly nudge to login
           if (err.message.includes("already registered") || err.message.includes("already exists") || err.message.includes("User already")) {
             setError("You're already a Slammer! Redirecting you to the login gate…");
             setTimeout(() => { setMode("login"); setError(""); }, 2000);
-          } else {
-            setError(friendlyError(err));
-          }
+          } else { setError(friendlyError(err)); }
           return;
         }
         if (data.user) {
           if (!data.session) {
-            // Email confirmation required (Supabase setting: confirm emails = ON)
-            // NOTE: marketing_consent is stored in auth.users metadata (line 254) and will be
-            // available after confirmation. A database trigger should copy it to profiles table.
-            // TODO: Create Supabase trigger to sync auth.users.raw_user_meta_data.marketing_consent
-            //       to public.profiles.marketing_consent on email confirmation.
-            // TODO: Sync users with marketing_consent: true to email automation provider
-            //       (e.g., Mailchimp, SendGrid, Customer.io) via webhook or scheduled job.
             setMessage("✅ Almost there! We've sent a confirmation link to your inbox. Click it to activate your account and start Slamming.");
           } else {
-            // Auto-confirmed (e.g. local dev / confirm emails = OFF)
-            // TODO: Sync users with marketing_consent: true to email automation provider.
             await supabase.from("profiles").update({
               marketing_consent: marketingConsent,
               terms_accepted: true,
@@ -287,7 +535,6 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
           }
         }
       } else {
-        // Login
         const { data, error: err } = await supabase.auth.signInWithPassword({ email, password });
         if (err) { setError(friendlyError(err)); return; }
         if (data.user && !data.user.email_confirmed_at) {
@@ -298,12 +545,9 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
       }
     } catch (err) {
       setError(friendlyError(err));
-    } finally {
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   };
 
-  // ── Password recovery ────────────────────────────────────────────────────
   const handleForgotPassword = async (e) => {
     e.preventDefault();
     if (!email.trim()) { setError("Enter your email address above first."); return; }
@@ -314,11 +558,8 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
       });
       if (err) { setError(friendlyError(err)); return; }
       setMode("forgot-sent");
-    } catch (err) {
-      setError(friendlyError(err));
-    } finally {
-      setLoading(false);
-    }
+    } catch (err) { setError(friendlyError(err)); }
+    finally { setLoading(false); }
   };
 
   const s = {
@@ -340,12 +581,11 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
     link:      { color:"#C05F2F",textDecoration:"underline" },
   };
 
-  // ── Heading & subheading copy by mode ────────────────────────────────────
   const copy = {
-    signup:      { h: "Create Free Account",      sub: "Sign up to save your Slam progress and unlock levels." },
-    login:       { h: "Back to the Slam",          sub: "Your Swara journey continues right here." },
-    forgot:      { h: "Reset Your Password",       sub: "Enter your email and we'll send you a reset link." },
-    "forgot-sent": { h: "Check Your Inbox",        sub: "A password reset link is on its way." },
+    signup:        { h: "Create Free Account",  sub: "Sign up to save your Slam progress and unlock levels." },
+    login:         { h: "Back to the Slam",     sub: "Your Swara journey continues right here." },
+    forgot:        { h: "Reset Your Password",  sub: "Enter your email and we'll send you a reset link." },
+    "forgot-sent": { h: "Check Your Inbox",     sub: "A password reset link is on its way." },
   };
 
   return (
@@ -354,8 +594,6 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
         <button style={s.closeBtn} onClick={onClose} aria-label="Close">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="#1C1A17" strokeWidth="2" strokeLinecap="round"/></svg>
         </button>
-
-        {/* ── Branding: RaagGuru · Swara Slam ── */}
         <div style={s.logo}>
           <div style={{display:"flex",alignItems:"baseline",justifyContent:"center",gap:6,marginBottom:3}}>
             <span style={{fontFamily:"'Cormorant Garamond',serif",fontSize:15,fontWeight:600,color:"#9A7B50",letterSpacing:".04em"}}>RaagGuru</span>
@@ -366,63 +604,40 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
             <span style={{fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,fontStyle:"italic",color:"#C05F2F",lineHeight:1}}>Slam</span>
           </div>
         </div>
-
         <h2 style={s.heading}>{copy[mode].h}</h2>
         <p style={s.sub}>{copy[mode].sub}</p>
-
-        {/* ── Forgot-sent confirmation state — no form needed ── */}
         {mode === "forgot-sent" && (
           <div style={{textAlign:"center"}}>
             <div style={{fontSize:44,marginBottom:12}}>📬</div>
             <div style={{...s.success,marginBottom:20}}>
               We've sent a reset link to <strong>{email}</strong>. Check your inbox (and spam folder) — it expires in 1 hour.
             </div>
-            <button style={s.btn} onClick={() => { setMode("login"); setError(""); setMessage(""); }}>
-              Back to Log In
-            </button>
+            <button style={s.btn} onClick={() => { setMode("login"); setError(""); setMessage(""); }}>Back to Log In</button>
           </div>
         )}
-
-        {/* ── Signup / Login / Forgot form ── */}
         {mode !== "forgot-sent" && (
           <form onSubmit={mode === "forgot" ? handleForgotPassword : handleSubmit} style={s.form}>
-            {/* Honeypot — invisible to humans */}
             <input type="text" name="website_verification" value={honeypot}
               onChange={e => setHoneypot(e.target.value)}
-              style={{position:"absolute",left:"-9999px",width:1,height:1,opacity:0}}
-              tabIndex={-1} autoComplete="off"
-            />
-
-            <input
-              type="email" placeholder="Email address"
-              value={email} onChange={e => setEmail(e.target.value)}
-              required style={s.input} autoComplete="email"
-            />
-
-            {/* Password field — hidden on forgot-password view */}
+              style={{position:"absolute",left:"-9999px",width:1,height:1,opacity:0}} tabIndex={-1} autoComplete="off"/>
+            <input type="email" placeholder="Email address" value={email} onChange={e => setEmail(e.target.value)}
+              required style={s.input} autoComplete="email"/>
             {mode !== "forgot" && (
-              <input
-                type="password"
+              <input type="password"
                 placeholder={mode === "signup" ? "Create a password (min. 6 chars)" : "Password"}
                 value={password} onChange={e => setPassword(e.target.value)}
-                required minLength={6} style={s.input} autoComplete={mode === "signup" ? "new-password" : "current-password"}
-              />
+                required minLength={6} style={s.input}
+                autoComplete={mode === "signup" ? "new-password" : "current-password"}/>
             )}
-
-            {/* Forgot Password link — login view only, below password field */}
             {mode === "login" && (
               <button type="button" style={{...s.ghostLink,textAlign:"right",alignSelf:"flex-end"}}
-                onClick={() => { setMode("forgot"); setError(""); setMessage(""); }}>
-                Forgot password?
-              </button>
+                onClick={() => { setMode("forgot"); setError(""); setMessage(""); }}>Forgot password?</button>
             )}
-
-            {/* Signup-only checkboxes */}
             {mode === "signup" && (
               <>
                 <label style={s.checkRow}>
                   <input type="checkbox" checked={termsAccepted} onChange={e => setTerms(e.target.checked)}
-                    style={{width:16,height:16,accentColor:"#C05F2F",flexShrink:0,marginTop:2}} />
+                    style={{width:16,height:16,accentColor:"#C05F2F",flexShrink:0,marginTop:2}}/>
                   <span>I agree to the{" "}
                     <a href="#" style={s.link} onClick={e => { e.preventDefault(); onOpenLegal(); }}>Terms & Conditions</a>
                     {" "}and{" "}
@@ -431,38 +646,23 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
                 </label>
                 <label style={s.checkRow}>
                   <input type="checkbox" checked={marketingConsent} onChange={e => setMktConsent(e.target.checked)}
-                    style={{width:16,height:16,accentColor:"#C05F2F",flexShrink:0,marginTop:2}} />
+                    style={{width:16,height:16,accentColor:"#C05F2F",flexShrink:0,marginTop:2}}/>
                   <span>Keep me in the loop on new RaagGuru features</span>
                 </label>
               </>
             )}
-
             {error   && <div style={s.error} role="alert">{error}</div>}
             {message && <div style={s.success} role="status">{message}</div>}
-
-            <button
-              type="submit"
-              disabled={loading || (mode === "signup" && !termsAccepted)}
-              style={{...s.btn, opacity:(loading || (mode === "signup" && !termsAccepted)) ? 0.5 : 1}}
-            >
-              {loading
-                ? "One moment…"
-                : mode === "login"   ? "Log In & Slam →"
-                : mode === "forgot"  ? "Send Reset Link"
-                :                      "Create Account & Play"}
+            <button type="submit" disabled={loading || (mode === "signup" && !termsAccepted)}
+              style={{...s.btn, opacity:(loading || (mode === "signup" && !termsAccepted)) ? 0.5 : 1}}>
+              {loading ? "One moment…" : mode === "login" ? "Log In & Slam →" : mode === "forgot" ? "Send Reset Link" : "Create Account & Play"}
             </button>
-
-            {/* Cancel link on forgot-password view */}
             {mode === "forgot" && (
               <button type="button" style={{...s.ghostLink,textAlign:"center",alignSelf:"center"}}
-                onClick={() => { setMode("login"); setError(""); }}>
-                ← Back to Log In
-              </button>
+                onClick={() => { setMode("login"); setError(""); }}>← Back to Log In</button>
             )}
           </form>
         )}
-
-        {/* ── Mode toggle footer (signup ↔ login only) ── */}
         {(mode === "signup" || mode === "login") && (
           <div style={s.toggle}>
             {mode === "login"
@@ -477,9 +677,6 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
 }
 
 // ─── Reset Password Modal ─────────────────────────────────────────────────────
-// Shown on screen === "reset-password" after the user arrives via the email link.
-// Supabase has already exchanged the token for a session by the time this renders,
-// so we only need supabase.auth.updateUser() — no token handling required here.
 function ResetPasswordModal({ onSuccess }) {
   const [newPassword,  setNewPassword]  = useState("");
   const [confirmPass,  setConfirmPass]  = useState("");
@@ -490,37 +687,24 @@ function ResetPasswordModal({ onSuccess }) {
   const handleReset = async (e) => {
     e.preventDefault();
     setError("");
-    if (newPassword.length < 6) {
-      setError("Password must be at least 6 characters.");
-      return;
-    }
-    if (newPassword !== confirmPass) {
-      setError("Passwords don't match — check both fields.");
-      return;
-    }
+    if (newPassword.length < 6) { setError("Password must be at least 6 characters."); return; }
+    if (newPassword !== confirmPass) { setError("Passwords don't match — check both fields."); return; }
     setLoading(true);
     try {
       const { error: err } = await supabase.auth.updateUser({ password: newPassword });
       if (err) {
-        // Friendly map for the most common reset errors
         if (err.message.includes("same password") || err.message.includes("should be different"))
           setError("New password must be different from your current one.");
         else if (err.message.includes("expired") || err.message.includes("invalid"))
           setError("This reset link has expired. Please request a new one from the login screen.");
-        else
-          setError(err.message.replace(/^AuthApiError:\s*/i, ""));
+        else setError(err.message.replace(/^AuthApiError:\s*/i, ""));
         return;
       }
-      // Clean the recovery hash from the URL immediately
       window.history.replaceState({}, "", window.location.pathname);
       setDone(true);
-      // Brief celebratory pause, then hand off to parent
       setTimeout(() => onSuccess(), 1800);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
+    } catch (err) { setError(err.message); }
+    finally { setLoading(false); }
   };
 
   const s = {
@@ -536,7 +720,6 @@ function ResetPasswordModal({ onSuccess }) {
     form:      { display:"flex",flexDirection:"column",gap:12,textAlign:"left" },
     label:     { fontFamily:"'DM Sans',sans-serif",fontSize:10,fontWeight:500,letterSpacing:".14em",textTransform:"uppercase",color:"#9A7B50",marginBottom:4,display:"block" },
     input:     { fontFamily:"'DM Sans',sans-serif",fontSize:15,padding:13,border:"1.5px solid #E5DFD3",borderRadius:8,backgroundColor:"#fff",color:"#1C1A17",outline:"none",width:"100%" },
-    inputFocus:{ borderColor:"#C05F2F" },
     error:     { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#C05F2F",background:"rgba(192,95,47,0.07)",padding:"10px 12px",borderRadius:8,border:"1px solid rgba(192,95,47,0.18)",lineHeight:1.5 },
     btn:       { fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:600,padding:14,backgroundColor:"#C05F2F",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",marginTop:4,transition:"background .15s,transform .1s",letterSpacing:".03em" },
     successBox:{ display:"flex",flexDirection:"column",alignItems:"center",gap:14 },
@@ -548,7 +731,6 @@ function ResetPasswordModal({ onSuccess }) {
   return (
     <div style={s.wrap}>
       <div style={s.card}>
-        {/* Brand lockup */}
         <div style={s.logoRow}>
           <p style={s.eyebrow}>Re-enter the arena</p>
           <div style={s.brandRow}>
@@ -556,58 +738,32 @@ function ResetPasswordModal({ onSuccess }) {
             <span style={s.slam}>Slam</span>
           </div>
         </div>
-
         {done ? (
-          /* ── Success state ── */
           <div style={s.successBox}>
             <span style={s.tick}>🔓</span>
             <h2 style={{...s.heading,marginBottom:0}}>You're Back In!</h2>
-            <div style={s.successMsg}>
-              Password updated. Your Swara journey continues — heading to the arena now…
-            </div>
+            <div style={s.successMsg}>Password updated. Your Swara journey continues — heading to the arena now…</div>
             <p style={s.hint}>Taking you to the Ready screen…</p>
           </div>
         ) : (
-          /* ── Password entry form ── */
           <>
             <h2 style={s.heading}>Set Your New Password</h2>
-            <p style={s.sub}>
-              Choose a strong password to reclaim your spot in the arena.
-            </p>
+            <p style={s.sub}>Choose a strong password to reclaim your spot in the arena.</p>
             <form onSubmit={handleReset} style={s.form}>
               <div>
                 <label style={s.label} htmlFor="rp-new">New Password</label>
-                <input
-                  id="rp-new"
-                  type="password"
-                  placeholder="At least 6 characters"
-                  value={newPassword}
-                  onChange={e => setNewPassword(e.target.value)}
-                  required minLength={6}
-                  style={s.input}
-                  autoComplete="new-password"
-                  autoFocus
-                />
+                <input id="rp-new" type="password" placeholder="At least 6 characters" value={newPassword}
+                  onChange={e => setNewPassword(e.target.value)} required minLength={6}
+                  style={s.input} autoComplete="new-password" autoFocus/>
               </div>
               <div>
                 <label style={s.label} htmlFor="rp-confirm">Confirm Password</label>
-                <input
-                  id="rp-confirm"
-                  type="password"
-                  placeholder="Repeat your new password"
-                  value={confirmPass}
-                  onChange={e => setConfirmPass(e.target.value)}
-                  required minLength={6}
-                  style={s.input}
-                  autoComplete="new-password"
-                />
+                <input id="rp-confirm" type="password" placeholder="Repeat your new password" value={confirmPass}
+                  onChange={e => setConfirmPass(e.target.value)} required minLength={6}
+                  style={s.input} autoComplete="new-password"/>
               </div>
               {error && <div style={s.error} role="alert">{error}</div>}
-              <button
-                type="submit"
-                disabled={loading}
-                style={{...s.btn, opacity: loading ? 0.55 : 1}}
-              >
+              <button type="submit" disabled={loading} style={{...s.btn, opacity: loading ? 0.55 : 1}}>
                 {loading ? "Updating…" : "Update & Start Slamming 🎵"}
               </button>
             </form>
@@ -620,19 +776,15 @@ function ResetPasswordModal({ onSuccess }) {
 
 // ─── Feedback Modal ───────────────────────────────────────────────────────────
 function FeedbackModal({ user, onClose }) {
-  const [feedback, setFeedback]   = useState("");
-  const [loading,  setLoading]    = useState(false);
-  const [success,  setSuccess]    = useState(false);
-  const [error,    setError]      = useState("");
+  const [feedback, setFeedback] = useState("");
+  const [loading,  setLoading]  = useState(false);
+  const [success,  setSuccess]  = useState(false);
+  const [error,    setError]    = useState("");
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!feedback.trim()) {
-      setError("Please write something before submitting.");
-      return;
-    }
-    setLoading(true);
-    setError("");
+    if (!feedback.trim()) { setError("Please write something before submitting."); return; }
+    setLoading(true); setError("");
     try {
       const { error: err } = await supabase.from("feedback").insert({
         user_id: user?.id || null,
@@ -645,22 +797,20 @@ function FeedbackModal({ user, onClose }) {
     } catch (err) {
       setError("Couldn't send feedback right now. Please try again.");
       console.error("Feedback error:", err);
-    } finally {
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   };
 
   const s = {
-    overlay:   { position:"fixed",inset:0,backgroundColor:"rgba(28,26,23,0.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999999,backdropFilter:"blur(5px)",padding:"1rem" },
-    modal:     { backgroundColor:"#F9F7F2",borderRadius:16,padding:"32px 32px 28px",maxWidth:480,width:"100%",boxShadow:"0 20px 60px rgba(192,95,47,0.2)",position:"relative",border:"2px solid #9A7B50" },
-    closeBtn:  { position:"absolute",top:12,right:12,background:"none",border:"none",cursor:"pointer",padding:8,opacity:0.45,lineHeight:0 },
-    heading:   { fontFamily:"'Cormorant Garamond',serif",fontSize:26,fontWeight:600,color:"#1C1A17",margin:"0 0 6px",textAlign:"center" },
-    sub:       { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#6B6560",textAlign:"center",margin:"0 0 20px",lineHeight:1.5 },
-    form:      { display:"flex",flexDirection:"column",gap:12 },
-    textarea:  { fontFamily:"'DM Sans',sans-serif",fontSize:14,padding:"12px 14px",border:"1.5px solid #E5DFD3",borderRadius:8,backgroundColor:"#fff",color:"#1C1A17",outline:"none",resize:"vertical",minHeight:120,lineHeight:1.6 },
-    error:     { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#C05F2F",background:"rgba(192,95,47,0.08)",padding:"9px 12px",borderRadius:8,textAlign:"center",border:"1px solid rgba(192,95,47,0.2)" },
-    success:   { fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#2E7D32",background:"#E8F5E9",padding:"12px 16px",borderRadius:8,textAlign:"center",lineHeight:1.5 },
-    btn:       { fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:600,padding:13,backgroundColor:"#C05F2F",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",marginTop:2,transition:"background .15s" },
+    overlay:  { position:"fixed",inset:0,backgroundColor:"rgba(28,26,23,0.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999999,backdropFilter:"blur(5px)",padding:"1rem" },
+    modal:    { backgroundColor:"#F9F7F2",borderRadius:16,padding:"32px 32px 28px",maxWidth:480,width:"100%",boxShadow:"0 20px 60px rgba(192,95,47,0.2)",position:"relative",border:"2px solid #9A7B50" },
+    closeBtn: { position:"absolute",top:12,right:12,background:"none",border:"none",cursor:"pointer",padding:8,opacity:0.45,lineHeight:0 },
+    heading:  { fontFamily:"'Cormorant Garamond',serif",fontSize:26,fontWeight:600,color:"#1C1A17",margin:"0 0 6px",textAlign:"center" },
+    sub:      { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#6B6560",textAlign:"center",margin:"0 0 20px",lineHeight:1.5 },
+    form:     { display:"flex",flexDirection:"column",gap:12 },
+    textarea: { fontFamily:"'DM Sans',sans-serif",fontSize:14,padding:"12px 14px",border:"1.5px solid #E5DFD3",borderRadius:8,backgroundColor:"#fff",color:"#1C1A17",outline:"none",resize:"vertical",minHeight:120,lineHeight:1.6 },
+    error:    { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#C05F2F",background:"rgba(192,95,47,0.08)",padding:"9px 12px",borderRadius:8,textAlign:"center",border:"1px solid rgba(192,95,47,0.2)" },
+    success:  { fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#2E7D32",background:"#E8F5E9",padding:"12px 16px",borderRadius:8,textAlign:"center",lineHeight:1.5 },
+    btn:      { fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:600,padding:13,backgroundColor:"#C05F2F",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",marginTop:2,transition:"background .15s" },
   };
 
   return (
@@ -669,32 +819,20 @@ function FeedbackModal({ user, onClose }) {
         <button style={s.closeBtn} onClick={onClose} aria-label="Close">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="#1C1A17" strokeWidth="2" strokeLinecap="round"/></svg>
         </button>
-
         {success ? (
           <div style={{textAlign:"center",padding:"20px 0"}}>
             <div style={{fontSize:52,marginBottom:12}}>🙏</div>
-            <div style={s.success}>
-              Thank you! Your feedback helps us make Swara Slam better for everyone.
-            </div>
+            <div style={s.success}>Thank you! Your feedback helps us make Swara Slam better for everyone.</div>
           </div>
         ) : (
           <>
             <h2 style={s.heading}>Share Your Feedback</h2>
-            <p style={s.sub}>
-              Help us improve Swara Slam — tell us what's working, what's not, or what you'd love to see next.
-            </p>
+            <p style={s.sub}>Help us improve Swara Slam — tell us what's working, what's not, or what you'd love to see next.</p>
             <form onSubmit={handleSubmit} style={s.form}>
-              <textarea
-                placeholder="Your thoughts, suggestions, bugs, or just a hello..."
-                value={feedback}
-                onChange={e => setFeedback(e.target.value)}
-                style={s.textarea}
-                maxLength={2000}
-                autoFocus
-              />
-              <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",textAlign:"right"}}>
-                {feedback.length} / 2000
-              </div>
+              <textarea placeholder="Your thoughts, suggestions, bugs, or just a hello..."
+                value={feedback} onChange={e => setFeedback(e.target.value)}
+                style={s.textarea} maxLength={2000} autoFocus/>
+              <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",textAlign:"right"}}>{feedback.length} / 2000</div>
               {error && <div style={s.error} role="alert">{error}</div>}
               <button type="submit" disabled={loading} style={{...s.btn, opacity: loading ? 0.55 : 1}}>
                 {loading ? "Sending..." : "Send Feedback"}
@@ -710,68 +848,15 @@ function FeedbackModal({ user, onClose }) {
 // ─── Cookie Consent Banner ────────────────────────────────────────────────────
 function CookieBanner({ onAccept, onLearnMore }) {
   const s = {
-    banner: {
-      position: "fixed",
-      bottom: 0,
-      left: 0,
-      right: 0,
-      backgroundColor: "#1C1A17",
-      borderTop: "2px solid #9A7B50",
-      padding: "16px 20px",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: "16px",
-      flexWrap: "wrap",
-      zIndex: 999998,
-      boxShadow: "0 -4px 20px rgba(0,0,0,0.15)"
-    },
-    text: {
-      fontFamily: "'DM Sans',sans-serif",
-      fontSize: 13,
-      color: "#F9F7F2",
-      lineHeight: 1.5,
-      flex: "1 1 320px",
-      minWidth: 280
-    },
-    btnRow: {
-      display: "flex",
-      gap: 10,
-      flexShrink: 0
-    },
-    acceptBtn: {
-      fontFamily: "'DM Sans',sans-serif",
-      fontSize: 14,
-      fontWeight: 600,
-      padding: "10px 20px",
-      backgroundColor: "#C05F2F",
-      color: "#fff",
-      border: "none",
-      borderRadius: 8,
-      cursor: "pointer",
-      whiteSpace: "nowrap",
-      transition: "background .15s"
-    },
-    learnBtn: {
-      fontFamily: "'DM Sans',sans-serif",
-      fontSize: 14,
-      fontWeight: 500,
-      padding: "10px 18px",
-      backgroundColor: "transparent",
-      color: "#9A7B50",
-      border: "1.5px solid #9A7B50",
-      borderRadius: 8,
-      cursor: "pointer",
-      whiteSpace: "nowrap",
-      transition: "border-color .15s, color .15s"
-    }
+    banner:    { position:"fixed",bottom:0,left:0,right:0,backgroundColor:"#1C1A17",borderTop:"2px solid #9A7B50",padding:"16px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:"16px",flexWrap:"wrap",zIndex:999998,boxShadow:"0 -4px 20px rgba(0,0,0,0.15)" },
+    text:      { fontFamily:"'DM Sans',sans-serif",fontSize:13,color:"#F9F7F2",lineHeight:1.5,flex:"1 1 320px",minWidth:280 },
+    btnRow:    { display:"flex",gap:10,flexShrink:0 },
+    acceptBtn: { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"10px 20px",backgroundColor:"#C05F2F",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",whiteSpace:"nowrap",transition:"background .15s" },
+    learnBtn:  { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:500,padding:"10px 18px",backgroundColor:"transparent",color:"#9A7B50",border:"1.5px solid #9A7B50",borderRadius:8,cursor:"pointer",whiteSpace:"nowrap",transition:"border-color .15s, color .15s" },
   };
-
   return (
     <div style={s.banner}>
-      <p style={s.text}>
-        We use cookies to enhance your Swara Slam experience and analyze arena traffic. By continuing to play, you agree to our use of cookies.
-      </p>
+      <p style={s.text}>We use cookies to enhance your Swara Slam experience and analyze arena traffic. By continuing to play, you agree to our use of cookies.</p>
       <div style={s.btnRow}>
         <button style={s.learnBtn} onClick={onLearnMore}>Learn More</button>
         <button style={s.acceptBtn} onClick={onAccept}>Got it, let's Slam! 🎵</button>
@@ -782,150 +867,42 @@ function CookieBanner({ onAccept, onLearnMore }) {
 
 // ─── Legal Modal (Terms & Privacy) ────────────────────────────────────────────
 function LegalModal({ onClose }) {
-  const [tab, setTab] = useState("terms"); // "terms" | "privacy"
+  const [tab, setTab] = useState("terms");
 
   const s = {
-    overlay: {
-      position: "fixed",
-      inset: 0,
-      backgroundColor: "rgba(28,26,23,0.88)",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      zIndex: 999999,
-      backdropFilter: "blur(5px)",
-      padding: "1rem"
-    },
-    modal: {
-      backgroundColor: "#F9F7F2",
-      borderRadius: 16,
-      padding: "32px",
-      maxWidth: 680,
-      width: "100%",
-      maxHeight: "85vh",
-      display: "flex",
-      flexDirection: "column",
-      boxShadow: "0 20px 60px rgba(192,95,47,0.22)",
-      position: "relative",
-      border: "2px solid #9A7B50"
-    },
-    closeBtn: {
-      position: "absolute",
-      top: 12,
-      right: 12,
-      background: "none",
-      border: "none",
-      cursor: "pointer",
-      padding: 8,
-      opacity: 0.45,
-      lineHeight: 0
-    },
-    heading: {
-      fontFamily: "'Cormorant Garamond',serif",
-      fontSize: 28,
-      fontWeight: 600,
-      color: "#1C1A17",
-      margin: "0 0 16px",
-      textAlign: "center"
-    },
-    tabs: {
-      display: "flex",
-      gap: 8,
-      marginBottom: 20,
-      borderBottom: "1.5px solid #E5DFD3",
-      paddingBottom: 2
-    },
-    tab: {
-      fontFamily: "'DM Sans',sans-serif",
-      fontSize: 14,
-      fontWeight: 600,
-      padding: "8px 16px",
-      background: "none",
-      border: "none",
-      cursor: "pointer",
-      color: "#6B6560",
-      borderBottom: "2.5px solid transparent",
-      marginBottom: -2,
-      transition: "color .15s, border-color .15s"
-    },
-    tabActive: {
-      color: "#C05F2F",
-      borderBottomColor: "#C05F2F"
-    },
-    content: {
-      fontFamily: "'DM Sans',sans-serif",
-      fontSize: 14,
-      color: "#3C3935",
-      lineHeight: 1.7,
-      overflowY: "auto",
-      flex: 1,
-      paddingRight: 8
-    },
-    h2: {
-      fontFamily: "'Cormorant Garamond',serif",
-      fontSize: 20,
-      fontWeight: 600,
-      color: "#1C1A17",
-      marginTop: 24,
-      marginBottom: 10
-    },
-    h3: {
-      fontFamily: "'DM Sans',sans-serif",
-      fontSize: 15,
-      fontWeight: 600,
-      color: "#1C1A17",
-      marginTop: 18,
-      marginBottom: 8
-    },
-    p: {
-      marginBottom: 14
-    },
-    ul: {
-      paddingLeft: 22,
-      marginBottom: 14
-    },
-    li: {
-      marginBottom: 6
-    }
+    overlay:   { position:"fixed",inset:0,backgroundColor:"rgba(28,26,23,0.88)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999999,backdropFilter:"blur(5px)",padding:"1rem" },
+    modal:     { backgroundColor:"#F9F7F2",borderRadius:16,padding:"32px",maxWidth:680,width:"100%",maxHeight:"85vh",display:"flex",flexDirection:"column",boxShadow:"0 20px 60px rgba(192,95,47,0.22)",position:"relative",border:"2px solid #9A7B50" },
+    closeBtn:  { position:"absolute",top:12,right:12,background:"none",border:"none",cursor:"pointer",padding:8,opacity:0.45,lineHeight:0 },
+    heading:   { fontFamily:"'Cormorant Garamond',serif",fontSize:28,fontWeight:600,color:"#1C1A17",margin:"0 0 16px",textAlign:"center" },
+    tabs:      { display:"flex",gap:8,marginBottom:20,borderBottom:"1.5px solid #E5DFD3",paddingBottom:2 },
+    tab:       { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"8px 16px",background:"none",border:"none",cursor:"pointer",color:"#6B6560",borderBottom:"2.5px solid transparent",marginBottom:-2,transition:"color .15s, border-color .15s" },
+    tabActive: { color:"#C05F2F",borderBottomColor:"#C05F2F" },
+    content:   { fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#3C3935",lineHeight:1.7,overflowY:"auto",flex:1,paddingRight:8 },
+    h2:        { fontFamily:"'Cormorant Garamond',serif",fontSize:20,fontWeight:600,color:"#1C1A17",marginTop:24,marginBottom:10 },
+    h3:        { fontFamily:"'DM Sans',sans-serif",fontSize:15,fontWeight:600,color:"#1C1A17",marginTop:18,marginBottom:8 },
+    p:         { marginBottom:14 },
+    ul:        { paddingLeft:22,marginBottom:14 },
+    li:        { marginBottom:6 },
   };
 
   const termsContent = (
     <div>
-      <p style={s.p}>
-        <strong>Effective Date:</strong> May 14, 2026<br />
-        <strong>Last Updated:</strong> May 14, 2026
-      </p>
-      <p style={s.p}>
-        Welcome to <strong>Swara Slam</strong>, a Hindustani Classical Music practice application operated by <strong>RaagGuru</strong> ("we," "us," or "our"). By accessing or using Swara Slam (the "App"), you agree to be bound by these Terms & Conditions. If you do not agree, do not use the App.
-      </p>
-
+      <p style={s.p}><strong>Effective Date:</strong> May 14, 2026<br/><strong>Last Updated:</strong> May 14, 2026</p>
+      <p style={s.p}>Welcome to <strong>Swara Slam</strong>, a Hindustani Classical Music practice application operated by <strong>RaagGuru</strong> ("we," "us," or "our"). By accessing or using Swara Slam (the "App"), you agree to be bound by these Terms & Conditions. If you do not agree, do not use the App.</p>
       <h2 style={s.h2}>1. Intellectual Property & Ownership</h2>
-      <p style={s.p}>
-        All content, features, and functionality of Swara Slam — including but not limited to the "Slam" branding, pitch-detection algorithms, audio synthesis logic, user interface design, gamification mechanics, and scoring systems — are the exclusive property of RaagGuru and are protected by international copyright, trademark, and other intellectual property laws.
-      </p>
-      <p style={s.p}>
-        <strong>You may not:</strong>
-      </p>
+      <p style={s.p}>All content, features, and functionality of Swara Slam — including but not limited to the "Slam" branding, pitch-detection algorithms, audio synthesis logic, user interface design, gamification mechanics, and scoring systems — are the exclusive property of RaagGuru and are protected by international copyright, trademark, and other intellectual property laws.</p>
+      <p style={s.p}><strong>You may not:</strong></p>
       <ul style={s.ul}>
         <li style={s.li}>Reverse-engineer, decompile, or disassemble any part of the App's pitch-detection or audio generation logic.</li>
         <li style={s.li}>Extract, copy, or redistribute the App's proprietary algorithms or training data.</li>
         <li style={s.li}>Use the "Swara Slam" name, logo, or branding without our prior written consent.</li>
         <li style={s.li}>Create derivative works, clones, or competing products based on the App's functionality.</li>
       </ul>
-
       <h2 style={s.h2}>2. License to Use</h2>
-      <p style={s.p}>
-        Subject to your compliance with these Terms, RaagGuru grants you a limited, non-exclusive, non-transferable, revocable license to access and use Swara Slam for your personal, non-commercial practice and training purposes.
-      </p>
-
+      <p style={s.p}>Subject to your compliance with these Terms, RaagGuru grants you a limited, non-exclusive, non-transferable, revocable license to access and use Swara Slam for your personal, non-commercial practice and training purposes.</p>
       <h2 style={s.h2}>3. Right to Modify, Suspend, or Terminate</h2>
-      <p style={s.p}>
-        <strong>RaagGuru reserves the right to modify, suspend, or discontinue Swara Slam (or any part of it) at any time, with or without notice, for any reason.</strong> We may update features, change pricing, alter content, or terminate the service entirely without liability to you or any third party.
-      </p>
-      <p style={s.p}>
-        We also reserve the right to terminate or suspend your access to the App at our sole discretion if we believe you have violated these Terms or engaged in conduct harmful to the App, other users, or RaagGuru's interests.
-      </p>
-
+      <p style={s.p}><strong>RaagGuru reserves the right to modify, suspend, or discontinue Swara Slam (or any part of it) at any time, with or without notice, for any reason.</strong> We may update features, change pricing, alter content, or terminate the service entirely without liability to you or any third party.</p>
+      <p style={s.p}>We also reserve the right to terminate or suspend your access to the App at our sole discretion if we believe you have violated these Terms or engaged in conduct harmful to the App, other users, or RaagGuru's interests.</p>
       <h2 style={s.h2}>4. User Conduct</h2>
       <p style={s.p}>You agree to use the App responsibly and lawfully. Prohibited conduct includes:</p>
       <ul style={s.ul}>
@@ -934,191 +911,98 @@ function LegalModal({ onClose }) {
         <li style={s.li}>Impersonating other users or providing false information during account creation.</li>
         <li style={s.li}>Using the App for any unlawful purpose or in violation of any applicable regulations.</li>
       </ul>
-
       <h2 style={s.h2}>5. Payment & Subscriptions</h2>
-      <p style={s.p}>
-        Certain features of Swara Slam require payment ("Premium Access"). All payments are processed securely through Stripe. By purchasing Premium Access, you agree to Stripe's terms and authorize RaagGuru to charge your selected payment method.
-      </p>
-      <p style={s.p}>
-        <strong>Refund Policy:</strong> All sales are final. We do not offer refunds for Premium Access purchases except as required by law.
-      </p>
-
+      <p style={s.p}>Certain features of Swara Slam require payment ("Premium Access"). All payments are processed securely through Stripe. By purchasing Premium Access, you agree to Stripe's terms and authorize RaagGuru to charge your selected payment method.</p>
+      <p style={s.p}><strong>Refund Policy:</strong> All sales are final. We do not offer refunds for Premium Access purchases except as required by law.</p>
       <h2 style={s.h2}>6. No Warranty & Disclaimer</h2>
-      <p style={s.p}>
-        <strong>THE APP IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED.</strong> RaagGuru makes no guarantees regarding:
-      </p>
+      <p style={s.p}><strong>THE APP IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED.</strong> RaagGuru makes no guarantees regarding:</p>
       <ul style={s.ul}>
         <li style={s.li}>The accuracy of pitch detection or scoring.</li>
         <li style={s.li}>Uninterrupted or error-free operation.</li>
         <li style={s.li}>Compatibility with all devices or browsers.</li>
         <li style={s.li}>Results, progress, or skill improvement from using the App.</li>
       </ul>
-      <p style={s.p}>
-        <strong>Health & Safety:</strong> Vocal practice can cause strain. Use the App responsibly and stop immediately if you experience discomfort. RaagGuru is not liable for any vocal injury, hearing damage, or hardware issues arising from your use of the App.
-      </p>
-
+      <p style={s.p}><strong>Health & Safety:</strong> Vocal practice can cause strain. Use the App responsibly and stop immediately if you experience discomfort. RaagGuru is not liable for any vocal injury, hearing damage, or hardware issues arising from your use of the App.</p>
       <h2 style={s.h2}>7. Limitation of Liability</h2>
-      <p style={s.p}>
-        TO THE MAXIMUM EXTENT PERMITTED BY LAW, RAAGGURU SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR ANY LOSS OF PROFITS, REVENUE, DATA, OR USE, ARISING FROM YOUR USE OF THE APP, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
-      </p>
-
+      <p style={s.p}>TO THE MAXIMUM EXTENT PERMITTED BY LAW, RAAGGURU SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR ANY LOSS OF PROFITS, REVENUE, DATA, OR USE, ARISING FROM YOUR USE OF THE APP, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.</p>
       <h2 style={s.h2}>8. Indemnification</h2>
-      <p style={s.p}>
-        You agree to indemnify and hold harmless RaagGuru, its affiliates, and their respective officers, directors, and employees from any claims, damages, or expenses arising from your use of the App or violation of these Terms.
-      </p>
-
+      <p style={s.p}>You agree to indemnify and hold harmless RaagGuru, its affiliates, and their respective officers, directors, and employees from any claims, damages, or expenses arising from your use of the App or violation of these Terms.</p>
       <h2 style={s.h2}>9. Governing Law</h2>
-      <p style={s.p}>
-        These Terms are governed by the laws of Singapore, without regard to its conflict of law principles. Any disputes shall be resolved exclusively in the courts of Singapore.
-      </p>
-
+      <p style={s.p}>These Terms are governed by the laws of Singapore, without regard to its conflict of law principles. Any disputes shall be resolved exclusively in the courts of Singapore.</p>
       <h2 style={s.h2}>10. Changes to Terms</h2>
-      <p style={s.p}>
-        We may update these Terms from time to time. Continued use of the App after changes constitutes acceptance of the revised Terms. We will notify users of material changes via email or in-app notification.
-      </p>
-
+      <p style={s.p}>We may update these Terms from time to time. Continued use of the App after changes constitutes acceptance of the revised Terms. We will notify users of material changes via email or in-app notification.</p>
       <h2 style={s.h2}>11. Contact</h2>
-      <p style={s.p}>
-        For questions about these Terms, contact us via the in-app feedback feature or email <strong>legal@raagguru.com</strong> (placeholder).
-      </p>
+      <p style={s.p}>For questions about these Terms, contact us via the in-app feedback feature or email <strong>legal@raagguru.com</strong> (placeholder).</p>
     </div>
   );
 
   const privacyContent = (
     <div>
-      <p style={s.p}>
-        <strong>Effective Date:</strong> May 14, 2026<br />
-        <strong>Last Updated:</strong> May 14, 2026
-      </p>
-      <p style={s.p}>
-        RaagGuru ("we," "us," or "our") respects your privacy. This Privacy Policy explains how we collect, use, and protect your information when you use <strong>Swara Slam</strong> (the "App").
-      </p>
-
+      <p style={s.p}><strong>Effective Date:</strong> May 14, 2026<br/><strong>Last Updated:</strong> May 14, 2026</p>
+      <p style={s.p}>RaagGuru ("we," "us," or "our") respects your privacy. This Privacy Policy explains how we collect, use, and protect your information when you use <strong>Swara Slam</strong> (the "App").</p>
       <h2 style={s.h2}>1. Information We Collect</h2>
-      
       <h3 style={s.h3}>a. Account Information</h3>
-      <p style={s.p}>
-        When you create an account, we collect your <strong>email address</strong> and a securely hashed <strong>password</strong> (via Supabase authentication). Your email is used for account management, password recovery, and transactional communications.
-      </p>
-
+      <p style={s.p}>When you create an account, we collect your <strong>email address</strong> and a securely hashed <strong>password</strong> (via Supabase authentication). Your email is used for account management, password recovery, and transactional communications.</p>
       <h3 style={s.h3}>b. Usage Data</h3>
-      <p style={s.p}>
-        We collect information about how you interact with the App, including:
-      </p>
+      <p style={s.p}>We collect information about how you interact with the App, including:</p>
       <ul style={s.ul}>
         <li style={s.li}>Level progress, set completion, and scoring data.</li>
         <li style={s.li}>Pitch detection metrics (note accuracy, timing, BPM settings).</li>
         <li style={s.li}>Session duration and feature usage (e.g., Tanpura drone on/off, Sa pitch selection).</li>
       </ul>
-      <p style={s.p}>
-        This data is stored in our Supabase database and is used to personalize your experience, track your progress, and improve the App.
-      </p>
-
       <h3 style={s.h3}>c. Device & Browser Information</h3>
-      <p style={s.p}>
-        We may collect technical information such as your browser type, device model, operating system, IP address, and screen resolution. This helps us optimize the App's performance and troubleshoot issues.
-      </p>
-
+      <p style={s.p}>We may collect technical information such as your browser type, device model, operating system, IP address, and screen resolution.</p>
       <h3 style={s.h3}>d. Cookies & Analytics</h3>
-      <p style={s.p}>
-        We use cookies and similar tracking technologies to enhance your experience and analyze App traffic. This includes:
-      </p>
       <ul style={s.ul}>
         <li style={s.li}><strong>Essential Cookies:</strong> Required for authentication and session management (e.g., Supabase session tokens).</li>
         <li style={s.li}><strong>Analytics Cookies:</strong> Used to understand user behavior and improve the App (e.g., Google Analytics, Facebook Pixel — to be implemented).</li>
         <li style={s.li}><strong>Preference Cookies:</strong> Store your settings (e.g., cookie consent, walkthrough dismissal).</li>
       </ul>
-      <p style={s.p}>
-        You can manage cookie preferences through your browser settings, but disabling certain cookies may limit App functionality.
-      </p>
-
       <h3 style={s.h3}>e. Microphone Access</h3>
-      <p style={s.p}>
-        The App requests <strong>microphone access</strong> to enable real-time pitch detection. Audio is processed locally in your browser and is <strong>not recorded, stored, or transmitted</strong> to our servers. You can revoke microphone access at any time through your browser or device settings.
-      </p>
-
+      <p style={s.p}>The App requests <strong>microphone access</strong> to enable real-time pitch detection. Audio is processed locally in your browser and is <strong>not recorded, stored, or transmitted</strong> to our servers.</p>
       <h3 style={s.h3}>f. Feedback Submissions</h3>
-      <p style={s.p}>
-        When you submit feedback via the in-app modal, we collect your <strong>user ID</strong> (if logged in), <strong>email address</strong>, and the <strong>feedback text</strong>. This data is stored securely in our database and is used solely to improve the App.
-      </p>
-
+      <p style={s.p}>When you submit feedback via the in-app modal, we collect your <strong>user ID</strong> (if logged in), <strong>email address</strong>, and the <strong>feedback text</strong>.</p>
       <h2 style={s.h2}>2. How We Use Your Information</h2>
-      <p style={s.p}>We use the collected information to:</p>
       <ul style={s.ul}>
         <li style={s.li}>Provide, operate, and maintain the App.</li>
-        <li style={s.li}>Personalize your practice experience (e.g., save your progress, restore session state).</li>
+        <li style={s.li}>Personalize your practice experience.</li>
         <li style={s.li}>Process payments and manage subscriptions (via Stripe).</li>
         <li style={s.li}>Send transactional emails (e.g., password resets, payment confirmations).</li>
         <li style={s.li}>Analyze usage patterns to improve features and fix bugs.</li>
         <li style={s.li}>Respond to feedback and support inquiries.</li>
         <li style={s.li}>Comply with legal obligations and enforce our Terms & Conditions.</li>
       </ul>
-
       <h2 style={s.h2}>3. Information Sharing</h2>
-      <p style={s.p}>
-        We <strong>do not sell</strong> your personal information. We may share your data in the following limited circumstances:
-      </p>
+      <p style={s.p}>We <strong>do not sell</strong> your personal information. We may share your data in the following limited circumstances:</p>
       <ul style={s.ul}>
-        <li style={s.li}><strong>Service Providers:</strong> Third-party tools that help us operate the App (e.g., Supabase for database hosting, Stripe for payments, Vercel for hosting, future analytics providers).</li>
-        <li style={s.li}><strong>Legal Compliance:</strong> If required by law, court order, or government regulation, or to protect our rights and safety.</li>
-        <li style={s.li}><strong>Business Transfers:</strong> In the event of a merger, acquisition, or sale of assets, your information may be transferred to the new owner.</li>
+        <li style={s.li}><strong>Service Providers:</strong> Supabase, Stripe, Vercel, future analytics providers.</li>
+        <li style={s.li}><strong>Legal Compliance:</strong> If required by law or to protect our rights and safety.</li>
+        <li style={s.li}><strong>Business Transfers:</strong> In the event of a merger or acquisition.</li>
       </ul>
-
       <h2 style={s.h2}>4. Data Security</h2>
-      <p style={s.p}>
-        We implement industry-standard security measures to protect your data, including:
-      </p>
       <ul style={s.ul}>
         <li style={s.li}>Encrypted HTTPS connections.</li>
         <li style={s.li}>Secure password hashing (bcrypt via Supabase).</li>
         <li style={s.li}>Role-based access controls (RLS) on our database.</li>
       </ul>
-      <p style={s.p}>
-        However, no system is 100% secure. We cannot guarantee absolute security and are not liable for unauthorized access resulting from circumstances beyond our control.
-      </p>
-
       <h2 style={s.h2}>5. Data Retention</h2>
-      <p style={s.p}>
-        We retain your account data for as long as your account is active or as needed to provide the App. You may request account deletion at any time by contacting us via the feedback feature or <strong>privacy@raagguru.com</strong> (placeholder). Upon deletion:
-      </p>
-      <ul style={s.ul}>
-        <li style={s.li}>Your account and personal data will be permanently removed within 30 days.</li>
-        <li style={s.li}>Anonymized usage data may be retained for analytics purposes.</li>
-        <li style={s.li}>Legal or regulatory requirements may necessitate longer retention periods.</li>
-      </ul>
-
+      <p style={s.p}>We retain your account data for as long as your account is active. You may request account deletion via the feedback feature or <strong>privacy@raagguru.com</strong> (placeholder). Your data will be permanently removed within 30 days.</p>
       <h2 style={s.h2}>6. Your Rights</h2>
-      <p style={s.p}>Depending on your jurisdiction, you may have the following rights:</p>
       <ul style={s.ul}>
-        <li style={s.li}><strong>Access:</strong> Request a copy of the personal data we hold about you.</li>
+        <li style={s.li}><strong>Access:</strong> Request a copy of your personal data.</li>
         <li style={s.li}><strong>Correction:</strong> Update or correct inaccurate information.</li>
         <li style={s.li}><strong>Deletion:</strong> Request deletion of your account and associated data.</li>
-        <li style={s.li}><strong>Opt-Out:</strong> Unsubscribe from marketing emails (if applicable).</li>
+        <li style={s.li}><strong>Opt-Out:</strong> Unsubscribe from marketing emails.</li>
         <li style={s.li}><strong>Data Portability:</strong> Request your data in a machine-readable format.</li>
       </ul>
-      <p style={s.p}>
-        To exercise these rights, contact us via <strong>privacy@raagguru.com</strong> (placeholder).
-      </p>
-
       <h2 style={s.h2}>7. Children's Privacy</h2>
-      <p style={s.p}>
-        Swara Slam is not intended for children under 13. We do not knowingly collect personal information from children. If you believe a child has provided us with their information, contact us immediately and we will delete it.
-      </p>
-
+      <p style={s.p}>Swara Slam is not intended for children under 13. We do not knowingly collect personal information from children.</p>
       <h2 style={s.h2}>8. International Data Transfers</h2>
-      <p style={s.p}>
-        Your data may be processed in servers located outside your country of residence (e.g., Supabase servers in the US or EU, Vercel CDN globally). By using the App, you consent to this transfer and acknowledge that data protection laws may differ across jurisdictions.
-      </p>
-
+      <p style={s.p}>Your data may be processed on servers outside your country of residence. By using the App, you consent to this transfer.</p>
       <h2 style={s.h2}>9. Changes to This Policy</h2>
-      <p style={s.p}>
-        We may update this Privacy Policy from time to time. Material changes will be communicated via email or in-app notification. Continued use after changes constitutes acceptance of the revised policy.
-      </p>
-
+      <p style={s.p}>We may update this Privacy Policy from time to time. Material changes will be communicated via email or in-app notification.</p>
       <h2 style={s.h2}>10. Contact Us</h2>
-      <p style={s.p}>
-        For privacy inquiries, contact us via the in-app feedback feature or email <strong>privacy@raagguru.com</strong> (placeholder).
-      </p>
+      <p style={s.p}>For privacy inquiries, contact us via the in-app feedback feature or email <strong>privacy@raagguru.com</strong> (placeholder).</p>
     </div>
   );
 
@@ -1126,49 +1010,28 @@ function LegalModal({ onClose }) {
     <div style={s.overlay} onClick={onClose}>
       <div style={s.modal} onClick={e => e.stopPropagation()}>
         <button style={s.closeBtn} onClick={onClose} aria-label="Close">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-            <path d="M18 6L6 18M6 6l12 12" stroke="#1C1A17" strokeWidth="2" strokeLinecap="round"/>
-          </svg>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="#1C1A17" strokeWidth="2" strokeLinecap="round"/></svg>
         </button>
-
         <h1 style={s.heading}>Legal</h1>
-
         <div style={s.tabs}>
-          <button
-            style={{...s.tab, ...(tab === "terms" ? s.tabActive : {})}}
-            onClick={() => setTab("terms")}
-          >
-            Terms & Conditions
-          </button>
-          <button
-            style={{...s.tab, ...(tab === "privacy" ? s.tabActive : {})}}
-            onClick={() => setTab("privacy")}
-          >
-            Privacy Policy
-          </button>
+          <button style={{...s.tab,...(tab==="terms"?s.tabActive:{})}} onClick={()=>setTab("terms")}>Terms & Conditions</button>
+          <button style={{...s.tab,...(tab==="privacy"?s.tabActive:{})}} onClick={()=>setTab("privacy")}>Privacy Policy</button>
         </div>
-
-        <div style={s.content}>
-          {tab === "terms" ? termsContent : privacyContent}
-        </div>
+        <div style={s.content}>{tab === "terms" ? termsContent : privacyContent}</div>
       </div>
     </div>
   );
 }
 
+// ─── Paywall Screen ───────────────────────────────────────────────────────────
 function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
   const btnBase = { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"13px 24px",color:"#fff",border:"none",borderRadius:8,cursor:redirecting?"not-allowed":"pointer",width:"100%" };
   const isRedirecting = (priceId) => redirecting && redirectingPriceId === priceId;
-
   return (
     <div style={{width:"100%",maxWidth:480,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",gap:20,padding:"32px 16px"}}>
       <div style={{fontSize:44}}>🔒</div>
-      <h2 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,color:"#1C1A17",margin:0,textAlign:"center"}}>
-        Unlock All 4 Levels
-      </h2>
-      <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>
-        Level 1 is free. Unlock chromatic swaras, advanced jumps, and three octaves with full access.
-      </p>
+      <h2 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,color:"#1C1A17",margin:0,textAlign:"center"}}>Unlock All 4 Levels</h2>
+      <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>Level 1 is free. Unlock chromatic swaras, advanced jumps, and three octaves with full access.</p>
       <div style={{display:"flex",gap:16,flexWrap:"wrap",justifyContent:"center",width:"100%",marginTop:8}}>
         <div style={{background:"#fff",border:"1.5px solid #E5DFD3",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center"}}>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>24-HOUR PASS</div>
@@ -1180,9 +1043,7 @@ function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
           </button>
         </div>
         <div style={{background:"linear-gradient(135deg,rgba(192,95,47,0.08),rgba(154,123,80,0.08))",border:"2px solid #C05F2F",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center",position:"relative"}}>
-          <div style={{position:"absolute",top:-12,left:"50%",transform:"translateX(-50%)",background:"#C05F2F",color:"#fff",padding:"3px 12px",borderRadius:20,fontSize:10,fontWeight:700,fontFamily:"'DM Sans',sans-serif",whiteSpace:"nowrap"}}>
-            BEST VALUE
-          </div>
+          <div style={{position:"absolute",top:-12,left:"50%",transform:"translateX(-50%)",background:"#C05F2F",color:"#fff",padding:"3px 12px",borderRadius:20,fontSize:10,fontWeight:700,fontFamily:"'DM Sans',sans-serif",whiteSpace:"nowrap"}}>BEST VALUE</div>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#C05F2F",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>LIFETIME ACCESS</div>
           <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:38,fontWeight:600,color:"#C05F2F",lineHeight:1,marginBottom:4}}>$9.99</div>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:"#6B6560",marginBottom:16}}>Unlock forever</div>
@@ -1376,8 +1237,8 @@ function useAudioEngine() {
         src.buffer = buf; g.gain.setValueAtTime(isDown ? 0.52 : 0.26, t);
         src.connect(g); g.connect(ctx.destination); src.start(t);
         const delay = Math.max(0, (t - ctx.currentTime) * 1000);
-        const cb = beat, ct = t, cs = scheduled;
-        setTimeout(() => onBeat(cb % 4, isDown, cs, ct), delay);
+        const cb = beat, cs = scheduled;
+        setTimeout(() => onBeat(cb % 4, isDown, cs, t), delay);
         nextBeatRef.current += spb; beatCountRef.current++; scheduled++;
       }
       if (scheduled < totalBeats) {
@@ -1391,9 +1252,9 @@ function useAudioEngine() {
     nextBeatRef.current = ctx.currentTime + 0.08; beatCountRef.current = 0; tick();
   }, [getCtx]);
 
-  const stopScheduler    = useCallback(() => { clearTimeout(schedTimerRef.current); schedTimerRef.current = null; }, []);
-  const resumeCtx        = useCallback(() => { if (ctxRef.current?.state === "suspended") ctxRef.current.resume(); }, []);
-  const updateDroneFreq  = useCallback((freq) => {
+  const stopScheduler   = useCallback(() => { clearTimeout(schedTimerRef.current); schedTimerRef.current = null; }, []);
+  const resumeCtx       = useCallback(() => { if (ctxRef.current?.state === "suspended") ctxRef.current.resume(); }, []);
+  const updateDroneFreq = useCallback((freq) => {
     if (!droneNodesRef.current.length || !ctxRef.current) return;
     const t = ctxRef.current.currentTime + 0.05;
     [freq,freq*2,freq*3,freq*5,freq*1.5,freq*3].forEach((f,i) => {
@@ -1401,81 +1262,57 @@ function useAudioEngine() {
     });
   }, []);
 
-  // ── Set complete "ding" — bright triangle-wave chime, distinct from guru notes ──
   const playSetDing = useCallback(() => {
-    const ctx = getCtx();
-    const t = ctx.currentTime + 0.05;
-    // Two-note quick chime: root + fifth
-    [[880, 0],[1320, 0.12]].forEach(([freq, delay]) => {
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = "triangle";
-      o.frequency.setValueAtTime(freq, t + delay);
-      g.gain.setValueAtTime(0, t + delay);
-      g.gain.linearRampToValueAtTime(0.18, t + delay + 0.012);
-      g.gain.exponentialRampToValueAtTime(0.001, t + delay + 0.45);
-      o.connect(g); g.connect(ctx.destination);
-      o.start(t + delay); o.stop(t + delay + 0.5);
+    const ctx = getCtx(), t = ctx.currentTime + 0.05;
+    [[880,0],[1320,0.12]].forEach(([freq,delay]) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "triangle"; o.frequency.setValueAtTime(freq, t+delay);
+      g.gain.setValueAtTime(0, t+delay);
+      g.gain.linearRampToValueAtTime(0.18, t+delay+0.012);
+      g.gain.exponentialRampToValueAtTime(0.001, t+delay+0.45);
+      o.connect(g); g.connect(ctx.destination); o.start(t+delay); o.stop(t+delay+0.5);
     });
   }, [getCtx]);
 
-  // ── Level up arpeggio — 5-note rising synth, square wave for game-feel ──
   const playLevelUpArp = useCallback(() => {
-    const ctx = getCtx();
-    const t = ctx.currentTime + 0.08;
-    // Sa Re Ga Pa Sa' — pentatonic rise, feels triumphant not cheesy
-    const freqs = [261.63, 293.66, 329.63, 392.00, 523.25];
-    freqs.forEach((freq, i) => {
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = "square";
-      o.frequency.setValueAtTime(freq, t + i * 0.11);
-      // Square wave can be harsh — low gain + steep decay
-      g.gain.setValueAtTime(0, t + i * 0.11);
-      g.gain.linearRampToValueAtTime(0.08, t + i * 0.11 + 0.015);
-      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.11 + 0.22);
-      o.connect(g); g.connect(ctx.destination);
-      o.start(t + i * 0.11); o.stop(t + i * 0.11 + 0.25);
+    const ctx = getCtx(), t = ctx.currentTime + 0.08;
+    const freqs = [261.63,293.66,329.63,392.00,523.25];
+    freqs.forEach((freq,i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "square"; o.frequency.setValueAtTime(freq, t+i*0.11);
+      g.gain.setValueAtTime(0, t+i*0.11);
+      g.gain.linearRampToValueAtTime(0.08, t+i*0.11+0.015);
+      g.gain.exponentialRampToValueAtTime(0.001, t+i*0.11+0.22);
+      o.connect(g); g.connect(ctx.destination); o.start(t+i*0.11); o.stop(t+i*0.11+0.25);
     });
-    // Final sustain chord: Sa + Pa together
-    [[261.63, 392.00]].forEach(([f]) => {
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = "sine";
-      o.frequency.setValueAtTime(f * 2, t + freqs.length * 0.11);
-      g.gain.setValueAtTime(0.1, t + freqs.length * 0.11);
-      g.gain.exponentialRampToValueAtTime(0.001, t + freqs.length * 0.11 + 0.6);
+    [[261.63,392.00]].forEach(([f]) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sine"; o.frequency.setValueAtTime(f*2, t+freqs.length*0.11);
+      g.gain.setValueAtTime(0.1, t+freqs.length*0.11);
+      g.gain.exponentialRampToValueAtTime(0.001, t+freqs.length*0.11+0.6);
       o.connect(g); g.connect(ctx.destination);
-      o.start(t + freqs.length * 0.11); o.stop(t + freqs.length * 0.11 + 0.65);
+      o.start(t+freqs.length*0.11); o.stop(t+freqs.length*0.11+0.65);
     });
   }, [getCtx]);
 
-  // ── Grand Slam fanfare — full ascending run + held chord ──
   const playGrandSlamFanfare = useCallback(() => {
-    const ctx = getCtx();
-    const t = ctx.currentTime + 0.08;
-    const freqs = [261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88, 523.25];
-    freqs.forEach((freq, i) => {
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = i < 4 ? "square" : "triangle";
-      o.frequency.setValueAtTime(freq, t + i * 0.09);
-      g.gain.setValueAtTime(0, t + i * 0.09);
-      g.gain.linearRampToValueAtTime(0.09, t + i * 0.09 + 0.015);
-      g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.09 + 0.3);
-      o.connect(g); g.connect(ctx.destination);
-      o.start(t + i * 0.09); o.stop(t + i * 0.09 + 0.35);
+    const ctx = getCtx(), t = ctx.currentTime + 0.08;
+    const freqs = [261.63,293.66,329.63,349.23,392.00,440.00,493.88,523.25];
+    freqs.forEach((freq,i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = i<4?"square":"triangle"; o.frequency.setValueAtTime(freq, t+i*0.09);
+      g.gain.setValueAtTime(0, t+i*0.09);
+      g.gain.linearRampToValueAtTime(0.09, t+i*0.09+0.015);
+      g.gain.exponentialRampToValueAtTime(0.001, t+i*0.09+0.3);
+      o.connect(g); g.connect(ctx.destination); o.start(t+i*0.09); o.stop(t+i*0.09+0.35);
     });
-    // Held major chord at end
-    [523.25, 659.25, 783.99].forEach((freq, i) => {
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = "sine";
-      o.frequency.setValueAtTime(freq, t + freqs.length * 0.09);
-      g.gain.setValueAtTime(0.09 - i * 0.02, t + freqs.length * 0.09);
-      g.gain.exponentialRampToValueAtTime(0.001, t + freqs.length * 0.09 + 1.2);
+    [523.25,659.25,783.99].forEach((freq,i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sine"; o.frequency.setValueAtTime(freq, t+freqs.length*0.09);
+      g.gain.setValueAtTime(0.09-i*0.02, t+freqs.length*0.09);
+      g.gain.exponentialRampToValueAtTime(0.001, t+freqs.length*0.09+1.2);
       o.connect(g); g.connect(ctx.destination);
-      o.start(t + freqs.length * 0.09); o.stop(t + freqs.length * 0.09 + 1.3);
+      o.start(t+freqs.length*0.09); o.stop(t+freqs.length*0.09+1.3);
     });
   }, [getCtx]);
 
@@ -1483,13 +1320,10 @@ function useAudioEngine() {
 }
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
-// MODIFIED: Added pitchMatched prop for green glow feedback
 function SwaraCard({ swara, state, pitchMatched }) {
   const oct = swara.octave ?? 1;
-  // pitchMatched adds .card-match on top of the existing state class
-  const extraClass = pitchMatched ? " card-match" : "";
   return (
-    <div className={"swara-card card-" + state + extraClass}>
+    <div className={"swara-card card-" + state + (pitchMatched ? " card-match" : "")}>
       <span className="card-dv">{swara.dv}</span>
       <span className={"card-name" + (oct === 0 ? " oct-mandra" : "")}>
         {swara.short}{oct === 2 && <span className="oct-dot-above">·</span>}
@@ -1502,7 +1336,7 @@ function BeatDots({ beat, active }) {
   return (
     <div className="beat-dots">
       {[0,1,2,3].map(i => (
-        <div key={i} className={"beat-dot" + (active && beat === i ? (i===0 ? " dot-dn" : " dot-up") : "")}/>
+        <div key={i} className={"beat-dot" + (active && beat === i ? (i===0?" dot-dn":" dot-up") : "")}/>
       ))}
     </div>
   );
@@ -1520,16 +1354,15 @@ const WT_STEPS = [
   { title:"Levels & Sets", body:"Each level has 5 sets. Complete all 5 to advance. Level 1 is free — unlock Full Access for Levels 2–4 with chromatic notes and wider jumps." },
 ];
 
-// ─── Title Hierarchy ──────────────────────────────────────────────────────────
-const TOTAL_PER_LEVEL  = ACTIVE_BEATS * SETS_PER_LEVEL; // 40
-const TOTAL_ALL_LEVELS = TOTAL_PER_LEVEL * LEVEL_CONFIG.length; // 160
+const TOTAL_PER_LEVEL  = ACTIVE_BEATS * SETS_PER_LEVEL;
+const TOTAL_ALL_LEVELS = TOTAL_PER_LEVEL * LEVEL_CONFIG.length;
 
 function getTitleForPct(pct) {
-  if (pct <= 20) return { title: "Shishya",  emoji: "🌱", color: "#9A7B50" };
-  if (pct <= 40) return { title: "Sadhak",   emoji: "🔥", color: "#C05F2F" };
-  if (pct <= 59) return { title: "Gyani",    emoji: "⚡", color: "#C05F2F" };
-  if (pct <= 79) return { title: "Pundit",   emoji: "🎯", color: "#1C1A17" };
-  return              { title: "Guru",      emoji: "✦",  color: "#9A7B50"  };
+  if (pct <= 20) return { title: "Shishya", emoji: "🌱", color: "#9A7B50" };
+  if (pct <= 40) return { title: "Sadhak",  emoji: "🔥", color: "#C05F2F" };
+  if (pct <= 59) return { title: "Gyani",   emoji: "⚡", color: "#C05F2F" };
+  if (pct <= 79) return { title: "Pundit",  emoji: "🎯", color: "#1C1A17" };
+  return              { title: "Guru",     emoji: "✦",  color: "#9A7B50"  };
 }
 
 function getLevelSummaryMessage(score, total) {
@@ -1547,61 +1380,61 @@ function getLevelSummaryMessage(score, total) {
 export default function SwaraSlamApp() {
 
   const [screen, setScreen] = useState("home");
-  const [authMode, setAuthMode] = useState("signup"); // Preferred mode for AuthModal
+  const [authMode, setAuthMode] = useState("signup");
+
+  // ── NEW: Admin dashboard visibility ───────────────────────────────────────
+  // showAdmin is set to true only when ?admin=true is present in the URL.
+  // It renders AdminDashboard as a fixed overlay on top of any screen.
+  const [showAdmin, setShowAdmin] = useState(false);
 
   // Game
-  const [isPlaying,      setIsPlaying]      = useState(false);
-  const [droneOn,        setDroneOn]        = useState(true);
-  const [saIndex,        setSaIndex]        = useState(0);
-  const [level,          setLevel]          = useState(0);
-  const [setNum,         setSetNum]         = useState(0);
-  const [cards,          setCards]          = useState(() => generateCards(0));
-  const [currentCards,   setCurrentCards]   = useState(null);
-  const [phase,          setPhase]          = useState("idle");
-  const [activeCard,     setActiveCard]     = useState(-1);
-  const [dotBeat,        setDotBeat]        = useState(-1);
-  const [bpm,            setBpm]            = useState(BASE_BPM);
-  const [manualBpm,      setManualBpm]      = useState(false);
-  const [bpmFlash,       setBpmFlash]       = useState(false);
-  const [confetti,       setConfetti]       = useState(false);
-  const [allLevelsUp,    setAllLevelsUp]    = useState(false);
-  const [showFeedback,   setShowFeedback]   = useState(false);
+  const [isPlaying,    setIsPlaying]    = useState(false);
+  const [droneOn,      setDroneOn]      = useState(true);
+  const [saIndex,      setSaIndex]      = useState(0);
+  const [level,        setLevel]        = useState(0);
+  const [setNum,       setSetNum]       = useState(0);
+  const [cards,        setCards]        = useState(() => generateCards(0));
+  const [currentCards, setCurrentCards] = useState(null);
+  const [phase,        setPhase]        = useState("idle");
+  const [activeCard,   setActiveCard]   = useState(-1);
+  const [dotBeat,      setDotBeat]      = useState(-1);
+  const [bpm,          setBpm]          = useState(BASE_BPM);
+  const [manualBpm,    setManualBpm]    = useState(false);
+  const [bpmFlash,     setBpmFlash]     = useState(false);
+  const [confetti,     setConfetti]     = useState(false);
+  const [allLevelsUp,  setAllLevelsUp]  = useState(false);
+  const [showFeedback,     setShowFeedback]     = useState(false);
   const [showCookieBanner, setShowCookieBanner] = useState(false);
   const [showLegalModal,   setShowLegalModal]   = useState(false);
 
-  // ── NEW: Scoring & pitch detection state ──────────────────────────────────
-  // score: total matched swaras in current set (resets each set)
-  // scoredCards: Set of card indices already scored this set (one-hit-per-card)
-  // micActive: drives usePitchDetection — true only when game is actively playing
-  const [score,        setScore]        = useState(0);
-  const [scoredCards,  setScoredCards]  = useState(new Set());
-  const scoredCardsRef = useRef(new Set());  // Ref mirror for use inside callbacks
-  const [micActive,    setMicActive]    = useState(false);
+  // Scoring & pitch detection
+  const [score,       setScore]       = useState(0);
+  const [scoredCards, setScoredCards] = useState(new Set());
+  const scoredCardsRef = useRef(new Set());
+  const [micActive,   setMicActive]   = useState(false);
 
-  // ── NEW: Cumulative level scoring ─────────────────────────────────────────
-  // levelTotalScore: accumulates set scores across a full level (resets on level change)
-  // levelSummaryData: { score, total, title, emoji, msg } — shown in Level Summary overlay
-  // grandSlamScore: total points across all 4 levels (160 max)
-  const [levelTotalScore,   setLevelTotalScore]   = useState(0);
-  const levelTotalScoreRef  = useRef(0);
-  const [levelSummaryData,  setLevelSummaryData]  = useState(null); // null = hidden
-  const [grandSlamScore,    setGrandSlamScore]    = useState(0);
-  const grandSlamScoreRef   = useRef(0);
-  // scoreRef: mirrors current set `score` for use inside advanceSet callback
+  // ── NEW: micErrorDismissed — lets user hide the banner without retrying ───
+  const [micErrorDismissed, setMicErrorDismissed] = useState(false);
+
+  // Cumulative level scoring
+  const [levelTotalScore,  setLevelTotalScore]  = useState(0);
+  const levelTotalScoreRef = useRef(0);
+  const [levelSummaryData, setLevelSummaryData] = useState(null);
+  const [grandSlamScore,   setGrandSlamScore]   = useState(0);
+  const grandSlamScoreRef  = useRef(0);
   const scoreRef = useRef(0);
 
-  // Compute the target frequency the user should be singing right now.
   const activeCardRef = useRef(activeCard);
   activeCardRef.current = activeCard;
   scoreRef.current = score;
 
-  // Auth/paywall
-  const [user,                  setUser]                  = useState(null);
-  const [isPremium,             setIsPremium]             = useState(false);
-  const [hasCompletedLevel1,    setHasCompletedLevel1]    = useState(false);
-  const [paywallRedirecting,    setPaywallRedirecting]    = useState(false);
-  const [redirectingPriceId,    setRedirectingPriceId]    = useState(null);
-  const [highestBpm,            setHighestBpm]            = useState(BASE_BPM);
+  // Auth / paywall
+  const [user,               setUser]               = useState(null);
+  const [isPremium,          setIsPremium]          = useState(false);
+  const [hasCompletedLevel1, setHasCompletedLevel1] = useState(false);
+  const [paywallRedirecting, setPaywallRedirecting] = useState(false);
+  const [redirectingPriceId, setRedirectingPriceId] = useState(null);
+  const [highestBpm,         setHighestBpm]         = useState(BASE_BPM);
 
   // Walkthrough
   const [showWalkthrough, setShowWalkthrough] = useState(false);
@@ -1629,94 +1462,135 @@ export default function SwaraSlamApp() {
 
   const autoBpm = BASE_BPM + setNum * BPM_INCREMENT;
 
-  // ── usePitchDetection — RULE #2 compliant isolated hook ───────────────────
-  // targetFreq = Sa * ratio of active card. -1 when no card is active.
+  // ── usePitchDetection — now also returns micError + retryMic ──────────────
   const activeCardData = (cardsRef.current && activeCard >= 0 && activeCard < cardsRef.current.length)
-    ? cardsRef.current[activeCard]
-    : null;
-  const targetFreq = activeCardData
-    ? SA_PITCHES[saIndex].freq * activeCardData.ratio
-    : -1;
+    ? cardsRef.current[activeCard] : null;
+  const targetFreq = activeCardData ? SA_PITCHES[saIndex].freq * activeCardData.ratio : -1;
 
-  const { isMatch } = usePitchDetection({
+  const { isMatch, micError, retryMic } = usePitchDetection({
     isActive:   micActive && phase === "active" && activeCard >= 0,
-    targetFreq: targetFreq > 0 ? targetFreq : 1, // prevent log(0)
+    targetFreq: targetFreq > 0 ? targetFreq : 1,
   });
 
-  // ── Scoring logic — one-hit-per-card ─────────────────────────────────────
-  // When isMatch flips true for a card index not yet scored this set, add point.
+  // ── Clear micErrorDismissed when a new set starts ─────────────────────────
+  useEffect(() => {
+    if (phase === "leadin") setMicErrorDismissed(false);
+  }, [phase]);
+
+  // ── Scoring logic ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!isMatch) return;
     if (phase !== "active") return;
     if (activeCard < 0) return;
-    if (scoredCardsRef.current.has(activeCard)) return; // already scored
-
+    if (scoredCardsRef.current.has(activeCard)) return;
     const next = new Set(scoredCardsRef.current);
     next.add(activeCard);
     scoredCardsRef.current = next;
     setScoredCards(next);
-    setScore(s => {
-      scoreRef.current = s + 1;
-      return s + 1;
-    });
-    // Accumulate into level total
-    setLevelTotalScore(lt => {
-      levelTotalScoreRef.current = lt + 1;
-      return lt + 1;
-    });
-    // Accumulate into grand slam total
-    setGrandSlamScore(gs => {
-      grandSlamScoreRef.current = gs + 1;
-      return gs + 1;
-    });
+    setScore(s => { scoreRef.current = s + 1; return s + 1; });
+    setLevelTotalScore(lt => { levelTotalScoreRef.current = lt + 1; return lt + 1; });
+    setGrandSlamScore(gs => { grandSlamScoreRef.current = gs + 1; return gs + 1; });
   }, [isMatch, activeCard, phase]);
 
-  // Reset per-set scoring state when a new set begins (activeCard resets to -1)
   useEffect(() => {
     if (phase === "idle" || phase === "leadin") {
       scoredCardsRef.current = new Set();
       setScoredCards(new Set());
-      // Don't reset total score here — it accumulates across the set
     }
   }, [phase]);
 
-  // ── Session restore & persistence ─────────────────────────────────────────
-  // Strategy:
-  //   1. Stripe return params handled first (before any auth check).
-  //   2. getSession() on mount — if a valid session exists, restore silently
-  //      and route directly to "home" (not "auth"). Supabase persists sessions
-  //      in localStorage automatically; this just reads what's already there.
-  //   3. onAuthStateChange keeps state in sync for the lifetime of the tab.
-  //      It only updates React state — it never drives screen changes — so it
-  //      cannot interfere with the Stripe, pitch-detection, or paywall flows.
+  // ── NEW: URL listener — activates admin dashboard via ?admin=true ─────────
+  // Checked once on mount. Clean the param from the URL after reading it to
+  // avoid accidental sharing of admin-enabled URLs.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("admin") === "true") {
+      setShowAdmin(true);
+      // Remove ?admin=true from browser URL bar (keeps page state intact)
+      params.delete("admin");
+      const newSearch = params.toString();
+      window.history.replaceState(
+        {},
+        "",
+        window.location.pathname + (newSearch ? "?" + newSearch : "")
+      );
+    }
+  }, []);
+
+  // ── Session restore & Stripe return handling ──────────────────────────────
   useEffect(() => {
     // ── 1. Stripe return URLs ──────────────────────────────────────────────
     const params = new URLSearchParams(window.location.search);
     if (params.get("success") === "true") {
       window.history.replaceState({}, "", window.location.pathname);
       let attempts = 0;
-      const maxAttempts = 5;
+      const maxAttempts = 8; // increased from 5 — gives webhook more time
+
+      // ── PAYMENT FIX: forcePremiumUpdate ───────────────────────────────────
+      // Last-resort fallback when the Stripe webhook has not updated the profiles
+      // row within the polling window. Uses supabaseAdmin (service role) to bypass
+      // RLS — the anon client write silently fails on most RLS configurations that
+      // correctly restrict is_premium to service-role-only updates (Fix 3d).
+      const forcePremiumUpdate = async (userId) => {
+        try {
+          const { error } = await supabaseAdmin.from("profiles")
+            .update({ is_premium: true })
+            .eq("id", userId);
+          if (error) throw error;
+          console.log("forcePremiumUpdate: profiles row updated via service role.");
+        } catch (e) {
+          console.error("forcePremiumUpdate failed:", e);
+        }
+      };
+
       const checkPremiumStatus = async () => {
         attempts++;
-        const { data: { session } } = await supabase.auth.getSession();
-        if (!session?.user) return;
+        // FIX 3b — use refreshSession() instead of getSession().
+        // getSession() reads from localStorage which may be null/stale if the
+        // supabaseAdmin client previously wrote to the same storage key (now
+        // fixed by Fix 1a, but defensive here regardless). refreshSession()
+        // always makes a live network call to the Supabase auth server, so it
+        // returns a valid session even if the local cache is corrupt.
+        // If the session is still null (e.g. user cleared storage mid-flow),
+        // retry rather than silently exit — the user just paid.
+        const { data: refreshData } = await supabase.auth.refreshSession();
+        const session = refreshData?.session;
+        if (!session?.user) {
+          // Session temporarily unavailable — keep retrying until maxAttempts
+          if (attempts < maxAttempts) {
+            setTimeout(checkPremiumStatus, 1000 * Math.pow(2, attempts - 1));
+          }
+          return;
+        }
+
         const { data: profile } = await supabase
           .from("profiles").select("is_premium").eq("id", session.user.id).single();
+
         if (profile?.is_premium) {
+          // Webhook already updated the row — proceed normally
           setIsPremium(true); isPremiumRef.current = true;
           userRef.current = session.user; setUser(session.user);
           setConfetti(true); setTimeout(() => setConfetti(false), 3500);
           setScreen("premium-unlocked");
           setTimeout(() => setScreen("game"), 3500);
         } else if (attempts < maxAttempts) {
-          setTimeout(checkPremiumStatus, 1000 * attempts); // exponential backoff
+          // FIX 3c — true exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s…
+          // Previous code used `1000 * attempts` (linear). With 8 attempts that
+          // exhausted the window in 36s total. Exponential gives 255s (4+ min),
+          // which comfortably covers most Stripe webhook delivery delays.
+          setTimeout(checkPremiumStatus, 1000 * Math.pow(2, attempts - 1));
         } else {
-          alert("Payment received but premium status not updated. Please refresh the page or contact support.");
-          setScreen("game");
+          // Webhook timed out — force-update the profile row, then proceed
+          await forcePremiumUpdate(session.user.id);
+          setIsPremium(true); isPremiumRef.current = true;
+          userRef.current = session.user; setUser(session.user);
+          setConfetti(true); setTimeout(() => setConfetti(false), 3500);
+          setScreen("premium-unlocked");
+          setTimeout(() => setScreen("game"), 3500);
         }
       };
       setTimeout(checkPremiumStatus, 1000);
-      return; // Don't fall through to session restore when handling Stripe return
+      return;
     }
 
     if (params.get("canceled") === "true") {
@@ -1724,45 +1598,28 @@ export default function SwaraSlamApp() {
     }
 
     // ── 2. Restore persisted session on mount ─────────────────────────────
-    // Supabase stores the session JWT in localStorage. getSession() reads it
-    // synchronously from storage (no network call if the token is still valid).
-    // If found, we load the player's profile and land them on "home" —
-    // they will never see the auth screen unless they explicitly log out.
     supabase.auth.getSession().then(({ data: { session }, error }) => {
       if (error) { console.warn("Session restore error:", error.message); return; }
       if (session?.user) {
         setUser(session.user);
         userRef.current = session.user;
-        // loadProfile sets level, setNum, isPremium — then we route to home
         loadProfile(session.user.id).then(() => {
-          // Only route if we're still on the initial "home" screen
-          // (don't override a Stripe redirect that already changed the screen)
           setScreen(prev => prev === "home" ? "home" : prev);
         });
       }
-      // No session → stay on "home" → user will click "Start Playing" → auth screen
     });
 
-    // ── 3. Auth state change listener — state sync only, except recovery ──
-    // onAuthStateChange fires PASSWORD_RECOVERY when Supabase detects the
-    // #access_token + type=recovery hash and exchanges it for a session.
-    // This is the correct point to route to the reset screen — the session
-    // is fully established by the time this fires, so updateUser() will work.
+    // ── 3. Auth state change listener ────────────────────────────────────
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === "PASSWORD_RECOVERY" && session?.user) {
-        // Route to reset-password screen immediately.
-        // Do NOT call loadProfile or change other state — the user is mid-recovery.
-        setUser(session.user);
-        userRef.current = session.user;
+        setUser(session.user); userRef.current = session.user;
         setScreen("reset-password");
         return;
       }
       if (session?.user) {
-        setUser(session.user);
-        userRef.current = session.user;
+        setUser(session.user); userRef.current = session.user;
         loadProfile(session.user.id);
       } else {
-        // SIGNED_OUT — clear everything
         setUser(null); userRef.current = null;
         setIsPremium(false); isPremiumRef.current = false;
       }
@@ -1770,30 +1627,13 @@ export default function SwaraSlamApp() {
 
     return () => subscription.unsubscribe();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
-  // loadProfile intentionally excluded — it's stable and defined before this effect
 
-  // ── Hash listener — catches #type=recovery on the initial URL load ────────
-  // Supabase email links look like:
-  //   https://swara-slam.vercel.app/reset-password#access_token=...&type=recovery
-  // Since we're a SPA with no /reset-password route, Vercel serves index.html
-  // for all paths. The hash is still present on mount, but onAuthStateChange
-  // (above) will fire PASSWORD_RECOVERY once Supabase processes the fragment.
-  // This useEffect is a belt-and-suspenders guard: if the component mounts
-  // with #type=recovery already in the hash AND onAuthStateChange fires before
-  // we attach the listener, we catch it here too.
   useEffect(() => {
     const hash = window.location.hash;
     if (hash.includes("type=recovery")) {
-      // Don't clean the hash yet — Supabase needs it to exchange the token.
-      // onAuthStateChange will fire PASSWORD_RECOVERY shortly after mount;
-      // setScreen("reset-password") happens there. This just ensures we're
-      // ready for that transition even if the effect ordering differs.
-      // If for any reason onAuthStateChange already fired before this effect
-      // ran, check for an existing session and route directly.
       supabase.auth.getSession().then(({ data: { session } }) => {
         if (session?.user) {
-          setUser(session.user);
-          userRef.current = session.user;
+          setUser(session.user); userRef.current = session.user;
           setScreen("reset-password");
         }
       });
@@ -1809,10 +1649,13 @@ export default function SwaraSlamApp() {
       const premium = data.is_premium || false;
       const completedL1 = lvl >= 1 || (lvl === 0 && sn >= SETS_PER_LEVEL);
       setLevel(lvl); setSetNum(sn);
-      setIsPremium(premium);
-      setHasCompletedLevel1(completedL1);
+      setIsPremium(premium); setHasCompletedLevel1(completedL1);
       isPremiumRef.current = premium;
-      userRef.current = user;
+      // FIX 3a — do NOT overwrite userRef.current here with a bare UUID string.
+      // Callers (getSession, onAuthStateChange, handleAuthSuccess) set userRef.current
+      // to the full Supabase User object before invoking loadProfile.
+      // Overwriting it with userId (a string) broke userRef.current.id downstream,
+      // causing saveProgress to silently bail at `if (!userRef.current)` every time.
       setHighestBpm(data.last_bpm || data.highest_bpm || BASE_BPM);
       setCards(generateCards(lvl)); setCurrentCards(null);
       return premium;
@@ -1839,15 +1682,10 @@ export default function SwaraSlamApp() {
     return () => window.removeEventListener("beforeinstallprompt", h);
   }, []);
 
-  // ── Cookie Consent Check ───────────────────────────────────────────────────
   useEffect(() => {
     const consent = localStorage.getItem("cookieConsent");
-    if (!consent) {
-      setTimeout(() => setShowCookieBanner(true), 1500); // Show after 1.5s delay
-    } else if (consent === "accepted") {
-      // Placeholder for analytics scripts — inject GA/FB Pixel here once ready
-      initializeAnalytics();
-    }
+    if (!consent) { setTimeout(() => setShowCookieBanner(true), 1500); }
+    else if (consent === "accepted") { initializeAnalytics(); }
   }, []);
 
   const handleCookieAccept = useCallback(() => {
@@ -1861,15 +1699,7 @@ export default function SwaraSlamApp() {
     setShowLegalModal(true);
   }, []);
 
-  // ── Analytics Initialization Placeholder ───────────────────────────────────
-  // This function will be populated with GA4 / Facebook Pixel scripts once ready.
   const initializeAnalytics = useCallback(() => {
-    // Future: Load Google Analytics gtag.js or Facebook Pixel here
-    // Example (commented out):
-    // window.dataLayer = window.dataLayer || [];
-    // function gtag(){dataLayer.push(arguments);}
-    // gtag('js', new Date());
-    // gtag('config', 'G-XXXXXXXXXX');
     console.log("Analytics initialized (placeholder)");
   }, []);
 
@@ -1882,15 +1712,8 @@ export default function SwaraSlamApp() {
     }
   }, [setNum, level]);
 
-  // ── Advance set/level ──────────────────────────────────────────────────────
-  // Level 1 free users: play all 5 sets uninterrupted.
-  // Paywall only appears via the Level Summary CTA after Set 5.
-  // All level transitions are now manual (player presses Continue on Summary card).
   const advanceSet = useCallback((lvl, sn) => {
-    const nextSet   = sn + 1;
-
-    // ── Mid-level set completed (applies to ALL users, ALL levels) ────────
-    // Free users on Level 1 are no longer interrupted mid-level.
+    const nextSet = sn + 1;
     if (nextSet < SETS_PER_LEVEL) {
       engine.playSetDing();
       setSetNum(nextSet);
@@ -1900,63 +1723,42 @@ export default function SwaraSlamApp() {
       saveProgress(lvl, nextSet, newBpm);
       return;
     }
-
-    // ── Set 5 completed — level done ─────────────────────────────────────
     const nextLevel  = lvl + 1;
     const levelTotal = levelTotalScoreRef.current;
     const summary    = getLevelSummaryMessage(levelTotal, TOTAL_PER_LEVEL);
-
-    // Sound: grand slam fanfare if all levels done, else level-up arp
-    if (nextLevel >= LEVEL_CONFIG.length) {
-      engine.playGrandSlamFanfare();
-    } else {
-      engine.playLevelUpArp();
-    }
+    if (nextLevel >= LEVEL_CONFIG.length) { engine.playGrandSlamFanfare(); }
+    else { engine.playLevelUpArp(); }
     setConfetti(true); setTimeout(() => setConfetti(false), 3200);
     if (nextLevel === 1) setHasCompletedLevel1(true);
-
-    // requiresUnlock: free user trying to continue past Level 1
     const requiresUnlock = !isPremiumRef.current && nextLevel >= 1;
-
-    // Show Level Summary card — it stays until player presses Continue / Unlock
     setLevelSummaryData({
-      ...summary,
-      levelTotal,
-      levelNum:       lvl + 1,        // level just finished (1-indexed)
-      nextLevel,                        // level about to start
-      isGrandSlam:    nextLevel >= LEVEL_CONFIG.length,
-      grandTotal:     grandSlamScoreRef.current,
-      requiresUnlock,                   // drives button label
+      ...summary, levelTotal,
+      levelNum: lvl + 1, nextLevel,
+      isGrandSlam: nextLevel >= LEVEL_CONFIG.length,
+      grandTotal: grandSlamScoreRef.current,
+      requiresUnlock,
     });
-    // No setTimeout — player dismisses manually
   }, [engine, saveProgress]);
 
-  // ── Playback ───────────────────────────────────────────────────────────────
   const startPlay = useCallback((replayCards) => {
     engine.stopScheduler();
     const playCards = replayCards || generateCards(levelRef.current);
     if (!replayCards) setCards(playCards);
     setCurrentCards(playCards); cardsRef.current = playCards;
-
-    // Reset per-set scoring (levelTotalScore accumulates — not reset here)
     setScore(0); scoreRef.current = 0;
     scoredCardsRef.current = new Set();
     setScoredCards(new Set());
-
     const effectiveBpm = manualBpmRef.current ? bpmRef.current : autoBpm;
     if (!manualBpmRef.current) setBpm(effectiveBpm);
     engine.resumeCtx();
     if (droneOn) engine.startDrone(SA_PITCHES[saIdxRef.current].freq);
-
     setPhase("leadin"); setActiveCard(-1); setDotBeat(-1); setIsPlaying(true);
-    setMicActive(true); // ← Start pitch detection when playback begins
-
+    setMicActive(true);
     engine.scheduleBeats(effectiveBpm, LEAD_IN_BEATS + ACTIVE_BEATS,
       (_dot, _isDown, seqIdx, sTime) => {
         setDotBeat(_dot);
-        if (seqIdx < LEAD_IN_BEATS) {
-          setPhase("leadin"); setActiveCard(-1);
-        } else {
+        if (seqIdx < LEAD_IN_BEATS) { setPhase("leadin"); setActiveCard(-1); }
+        else {
           setPhase("active");
           const ci = seqIdx - LEAD_IN_BEATS;
           setActiveCard(ci);
@@ -1965,8 +1767,7 @@ export default function SwaraSlamApp() {
       },
       () => {
         setPhase("done"); setIsPlaying(false); setActiveCard(-1); setDotBeat(-1);
-        setMicActive(false); // ← Stop pitch detection when set ends
-        engine.stopDrone();
+        setMicActive(false); engine.stopDrone();
         advanceSet(levelRef.current, setNumRef.current);
       }
     );
@@ -1992,32 +1793,17 @@ export default function SwaraSlamApp() {
     advanceSet(levelRef.current, setNumRef.current);
   }, [isPlaying, stopPlay, advanceSet]);
 
-  // ── Continue / Unlock button on Level Summary overlay ─────────────────────
-  // Called when player presses "Continue to Level X" or "Unlock Next Level".
-  // If requiresUnlock: dismiss summary, show paywall.
-  // Otherwise: transition to next level (or grand slam screen).
   const handleContinueLevel = useCallback((summaryData) => {
     setLevelSummaryData(null);
-
-    if (summaryData.isGrandSlam) {
-      // Grand slam path — show the allLevelsUp overlay
-      setAllLevelsUp(true);
-      return;
-    }
-
+    if (summaryData.isGrandSlam) { setAllLevelsUp(true); return; }
     if (summaryData.requiresUnlock) {
-      // Free user finished Level 1 — send to paywall
-      // Reset Level 1 state so they can replay after subscribing
       setLevel(0); setSetNum(0);
       setCards(generateCards(0)); setCurrentCards(null);
       if (!manualBpmRef.current) setBpm(BASE_BPM);
       setScore(0); scoreRef.current = 0;
       setLevelTotalScore(0); levelTotalScoreRef.current = 0;
-      setScreen("paywall");
-      return;
+      setScreen("paywall"); return;
     }
-
-    // Premium / free-advancing: move to next level
     const nextLevel = summaryData.nextLevel;
     setLevelTotalScore(0); levelTotalScoreRef.current = 0;
     setLevel(nextLevel); setSetNum(0);
@@ -2027,7 +1813,6 @@ export default function SwaraSlamApp() {
     setScoredCards(new Set()); scoredCardsRef.current = new Set();
     setPhase("idle"); setActiveCard(-1);
     saveProgress(nextLevel, 0, BASE_BPM);
-    // levelUpVisible is no longer used — transition is immediate via this handler
   }, [saveProgress]);
 
   const toggleDrone = useCallback(() => {
@@ -2062,50 +1847,31 @@ export default function SwaraSlamApp() {
     setScreen("ready");
   }, []);
 
-  // Called by ResetPasswordModal after supabase.auth.updateUser() succeeds.
-  // The session is already live; we just load the profile and go to "ready".
   const handlePasswordResetSuccess = useCallback(async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (session?.user) {
-      setUser(session.user);
-      userRef.current = session.user;
+      setUser(session.user); userRef.current = session.user;
       await loadProfile(session.user.id);
     }
-    // Hash was already cleaned inside ResetPasswordModal
     setScreen("ready");
   }, []);
 
-  // ── Native Share ───────────────────────────────────────────────────────────
   const handleShare = useCallback(async () => {
-    // Compute current title based on grand slam score
     const pct = grandSlamScoreRef.current > 0
-      ? Math.round((grandSlamScoreRef.current / TOTAL_ALL_LEVELS) * 100)
-      : 0;
+      ? Math.round((grandSlamScoreRef.current / TOTAL_ALL_LEVELS) * 100) : 0;
     const { title } = getTitleForPct(pct);
     const shareText = `I just Swara Slammed my way to ${title} status! Check out Swara Slam and test your rhythm: https://swara-slam.vercel.app`;
-
     if (navigator.share) {
-      try {
-        await navigator.share({ text: shareText });
-      } catch (err) {
-        // User canceled or share failed — silent
-        if (err.name !== "AbortError") console.error("Share failed:", err);
-      }
+      try { await navigator.share({ text: shareText }); }
+      catch (err) { if (err.name !== "AbortError") console.error("Share failed:", err); }
     } else {
-      // Fallback: copy to clipboard
-      try {
-        await navigator.clipboard.writeText(shareText);
-        alert("Link copied to clipboard! Share it anywhere you like.");
-      } catch (err) {
-        console.error("Clipboard failed:", err);
-        alert("Sharing not supported on this device.");
-      }
+      try { await navigator.clipboard.writeText(shareText); alert("Link copied to clipboard! Share it anywhere you like."); }
+      catch (err) { alert("Sharing not supported on this device."); }
     }
   }, []);
 
   const handleStripeCheckout = useCallback(async (priceId) => {
-    setPaywallRedirecting(true);
-    setRedirectingPriceId(priceId);
+    setPaywallRedirecting(true); setRedirectingPriceId(priceId);
     try {
       const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession();
       const session = refreshData?.session;
@@ -2147,8 +1913,8 @@ export default function SwaraSlamApp() {
   }, []);
 
   const trueDisplayCards = currentCards || cards;
-  const sliderPct    = Math.round(((bpm - 40) / (700 - 40)) * 100);
-  const isLocked     = level > 0 && !isPremium;
+  const sliderPct = Math.round(((bpm - 40) / (700 - 40)) * 100);
+  const isLocked  = level > 0 && !isPremium;
 
   const getCardState = (i) => {
     if (phase === "idle" || phase === "done") return "dim";
@@ -2238,13 +2004,10 @@ export default function SwaraSlamApp() {
         .card-active{transform:scale(1.1);background:#FFF3EE;border-color:#C05F2F;box-shadow:0 0 0 2.5px rgba(192,95,47,.4),0 6px 22px rgba(192,95,47,.25),0 2px 6px rgba(0,0,0,.07)}
         .card-active .card-dv{color:rgba(192,95,47,.5)}
         .card-active .card-name{color:#C05F2F}
-
-        /* ── NEW: Pitch match green glow ── */
         .card-match{background:#E8F5E9 !important;border-color:#2E7D32 !important;box-shadow:0 0 15px rgba(46,125,50,0.4),0 0 0 2px rgba(46,125,50,0.25) !important}
         .card-match .card-dv{color:rgba(46,125,50,0.5) !important}
         .card-match .card-name{color:#2E7D32 !important}
 
-        /* ── NEW: Score display ── */
         .score-strip{width:100%;max-width:480px;display:flex;align-items:center;justify-content:space-between;padding:.15rem 0 .45rem;min-height:24px}
         .score-label{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#9A7B50;font-weight:500}
         .score-pips{display:flex;gap:4px;align-items:center}
@@ -2255,7 +2018,6 @@ export default function SwaraSlamApp() {
         .score-fraction{font-family:'Cormorant Garamond',serif;font-size:16px;font-weight:600;color:#2E7D32;letter-spacing:.04em;min-width:32px;text-align:right;transition:opacity .2s}
         .score-fraction.zero{color:rgba(0,0,0,.2)}
 
-        /* ── NEW: Mic status indicator (subtle, top-right of arena) ── */
         .mic-status{display:flex;align-items:center;gap:4px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:rgba(0,0,0,.25);font-family:'DM Sans',sans-serif}
         .mic-dot{width:5px;height:5px;border-radius:50%;background:rgba(0,0,0,.15);flex-shrink:0}
         .mic-dot.listening{background:#2E7D32;animation:micPulse 1.4s ease-in-out infinite}
@@ -2290,7 +2052,6 @@ export default function SwaraSlamApp() {
         .overlay-title{font-family:'Cormorant Garamond',serif;font-size:clamp(42px,10vw,80px);font-weight:600;color:#C05F2F;font-style:italic;animation:titlePop .5s .1s cubic-bezier(.34,1.56,.64,1) both}
         .overlay-sub{font-size:12px;letter-spacing:.2em;text-transform:uppercase;color:#9A7B50}
 
-        /* ── Level Summary overlay ── */
         .summary-score-row{display:flex;align-items:baseline;gap:6px;margin:.2rem 0 .1rem}
         .summary-big{font-family:'Cormorant Garamond',serif;font-size:clamp(52px,12vw,88px);font-weight:600;color:#C05F2F;line-height:1;animation:titlePop .4s .2s cubic-bezier(.34,1.56,.64,1) both}
         .summary-of{font-family:'Cormorant Garamond',serif;font-size:clamp(22px,5vw,36px);font-weight:400;color:rgba(0,0,0,.3)}
@@ -2329,12 +2090,21 @@ export default function SwaraSlamApp() {
         .install-btn{width:100%;background:#C05F2F;color:#fff;border:none;border-radius:8px;padding:11px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;margin-top:10px}
         .install-btn:hover{background:#A0472A}
 
+        /* ── NEW: Admin key button — invisible until hovered ── */
+        .admin-key-btn{width:28px;height:28px;border-radius:50%;border:none;background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;opacity:0.08;transition:opacity .2s;flex-shrink:0}
+        .admin-key-btn:hover{opacity:0.55}
+
         @media(min-width:480px){.card-grid{gap:9px}}
         @media(min-width:768px){.arena-field{max-width:540px;padding:20px 18px}.card-grid{gap:11px}.ss-controls{max-width:540px}}
       `}</style>
 
       <Confetti active={confetti} />
       <BpmFlash bpm={manualBpm ? bpm : autoBpm} visible={bpmFlash} />
+
+      {/* ── NEW: Admin Dashboard overlay ── */}
+      {showAdmin && (
+        <AdminDashboard onClose={() => setShowAdmin(false)} />
+      )}
 
       {/* ── Walkthrough ── */}
       {showWalkthrough && (
@@ -2362,7 +2132,7 @@ export default function SwaraSlamApp() {
         </>
       )}
 
-      {/* ── Level Summary overlay — persistent, dismissed only by player ── */}
+      {/* ── Level Summary overlay ── */}
       {levelSummaryData && (
         <div className="overlay" style={{gap:"0.55rem"}}>
           <p className="overlay-eyebrow">Level {levelSummaryData.levelNum} Complete</p>
@@ -2379,59 +2149,41 @@ export default function SwaraSlamApp() {
           </div>
           <p className="summary-msg">{levelSummaryData.msg}</p>
           {levelSummaryData.isGrandSlam && (
-            <p className="summary-grand">
-              Grand Slam Total: <strong>{levelSummaryData.grandTotal} / {TOTAL_ALL_LEVELS}</strong>
-            </p>
+            <p className="summary-grand">Grand Slam Total: <strong>{levelSummaryData.grandTotal} / {TOTAL_ALL_LEVELS}</strong></p>
           )}
-          {/* CTA — label changes based on premium status and whether all levels are done */}
-          <button
-            className="primary-btn"
-            style={{marginTop:6}}
-            onClick={() => handleContinueLevel(levelSummaryData)}
-          >
+          <button className="primary-btn" style={{marginTop:6}} onClick={() => handleContinueLevel(levelSummaryData)}>
             {levelSummaryData.isGrandSlam
               ? "See Grand Slam Results"
               : levelSummaryData.requiresUnlock
                 ? "🔒 Unlock Level " + (levelSummaryData.nextLevel + 1)
                 : "Continue to Level " + (levelSummaryData.nextLevel + 1) + " →"}
           </button>
-          {/* Unlock path: ghost link to replay Level 1 instead */}
           {levelSummaryData.requiresUnlock && (
-            <button
-              className="ghost-btn"
-              style={{marginTop:2}}
-              onClick={() => {
-                setLevelSummaryData(null);
-                setLevel(0); setSetNum(0);
-                setCards(generateCards(0)); setCurrentCards(null);
-                if (!manualBpmRef.current) setBpm(BASE_BPM);
-                setScore(0); scoreRef.current = 0;
-                setLevelTotalScore(0); levelTotalScoreRef.current = 0;
-                setPhase("idle"); setActiveCard(-1);
-              }}
-            >
-              ← Replay Level 1
-            </button>
+            <button className="ghost-btn" style={{marginTop:2}} onClick={() => {
+              setLevelSummaryData(null);
+              setLevel(0); setSetNum(0);
+              setCards(generateCards(0)); setCurrentCards(null);
+              if (!manualBpmRef.current) setBpm(BASE_BPM);
+              setScore(0); scoreRef.current = 0;
+              setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+              setPhase("idle"); setActiveCard(-1);
+            }}>← Replay Level 1</button>
           )}
         </div>
       )}
 
-      {/* ── Level Up flash removed — transition is now via Summary card CTA ── */}
-
-      {/* ── Grand Slam — All Levels Done ── */}
+      {/* ── Grand Slam ── */}
       {allLevelsUp && (
         <div className="overlay" style={{gap:"0.7rem"}}>
           <p className="overlay-eyebrow">Grand Slam</p>
-          <div className="overlay-title" style={{fontSize:"clamp(34px,8vw,64px)"}}>
-            All 4 Levels!
-          </div>
+          <div className="overlay-title" style={{fontSize:"clamp(34px,8vw,64px)"}}>All 4 Levels!</div>
           <div className="summary-score-row">
             <span className="summary-big">{grandSlamScore}</span>
             <span className="summary-of">/ {TOTAL_ALL_LEVELS}</span>
             <span className="summary-label">Total Slam Points</span>
           </div>
           <div className="summary-bar-wrap">
-            <div className="summary-bar-fill" style={{width: Math.round((grandSlamScore / TOTAL_ALL_LEVELS) * 100) + "%" }} />
+            <div className="summary-bar-fill" style={{width: Math.round((grandSlamScore / TOTAL_ALL_LEVELS) * 100) + "%"}} />
           </div>
           {(() => {
             const pct = Math.round((grandSlamScore / TOTAL_ALL_LEVELS) * 100);
@@ -2479,7 +2231,7 @@ export default function SwaraSlamApp() {
       )}
 
       {/* ══════════════════════════════════════════════════════════════════════
-          SCREEN ROUTER — RULE #1: No changes to any screen logic below
+          SCREEN ROUTER
       ══════════════════════════════════════════════════════════════════════ */}
 
       {/* HOME */}
@@ -2494,9 +2246,7 @@ export default function SwaraSlamApp() {
           <button className="primary-btn" style={{marginTop:8}} onClick={() => {
             if (user) { setScreen("ready"); }
             else { setAuthMode("signup"); setScreen("auth"); }
-          }}>
-            Start Playing
-          </button>
+          }}>Start Playing</button>
           <div style={{display:"flex",gap:16,alignItems:"center",marginTop:4}}>
             <button className="ghost-btn" onClick={startWalkthrough}>How to play?</button>
             <span style={{color:"#9A7B50",fontSize:11}}>•</span>
@@ -2508,29 +2258,22 @@ export default function SwaraSlamApp() {
         </div>
       )}
 
-      {/* READY — MODIFIED: mic permission requested on "Begin ▶" click */}
+      {/* READY */}
       {screen === "ready" && (
         <div className="screen">
           <div className="ready-title">Ready?</div>
           <p className="ready-sub">Level 1 — {LEVEL_CONFIG[0].label}</p>
           <button className="primary-btn" style={{marginTop:16}} onClick={async () => {
-            // Request mic permission here, before entering the game screen.
-            // If denied, the game still works — scoring just won't function.
-            // usePitchDetection fails silently on permission denial.
             try {
               const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-              // Immediately release — the hook will re-acquire when needed
               stream.getTracks().forEach(t => t.stop());
             } catch (e) {
-              // Permission denied — continue gracefully without mic
               console.info("Mic permission denied; scoring will be unavailable.");
             }
             setScreen("game");
             const isFirstTime = !localStorage.getItem("walkthroughSeen");
             if (isFirstTime) setTimeout(() => startWalkthrough(), 200);
-          }}>
-            Begin ▶
-          </button>
+          }}>Begin ▶</button>
           <button className="ghost-btn" style={{marginTop:8}} onClick={() => setScreen("home")}>← Back</button>
         </div>
       )}
@@ -2551,7 +2294,7 @@ export default function SwaraSlamApp() {
         </div>
       )}
 
-      {/* RESET PASSWORD — shown when user arrives via recovery email link */}
+      {/* RESET PASSWORD */}
       {screen === "reset-password" && (
         <ResetPasswordModal onSuccess={handlePasswordResetSuccess} />
       )}
@@ -2579,9 +2322,7 @@ export default function SwaraSlamApp() {
             setLevelTotalScore(0); levelTotalScoreRef.current = 0;
             setMicActive(false); setLevelSummaryData(null);
             setScreen("game");
-          }}>
-            ← Back to Level 1
-          </button>
+          }}>← Back to Level 1</button>
         </div>
       )}
 
@@ -2603,20 +2344,33 @@ export default function SwaraSlamApp() {
                   <button className="user-chip-logout" onClick={handleLogout}>Log out</button>
                 </div>
               )}
+              {/* ── Share button ── */}
               <button className="icon-btn" onClick={handleShare} aria-label="Share Swara Slam" title="Share your progress">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
                   <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
                 </svg>
               </button>
+              {/* ── Feedback button ── */}
               <button className="icon-btn" onClick={() => setShowFeedback(true)} aria-label="Share Feedback" title="Send us feedback">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
                 </svg>
               </button>
+              {/* ── Tanpura drone toggle ── */}
               <button className={"icon-btn" + (droneOn ? " active" : "")} onClick={toggleDrone} aria-label={droneOn ? "Mute Tanpura" : "Enable Tanpura"}>
                 {droneOn ? <Volume2 /> : <VolumeX />}
               </button>
+              {/* ── NEW: Hidden admin key button ─────────────────────────────────
+                   Nearly invisible (opacity 0.08) — visible only on hover.
+                   Placed last in header actions so it doesn't disrupt layout.
+                   Opens AdminDashboard without any URL change.               ── */}
+              <button
+                className="admin-key-btn"
+                onClick={() => setShowAdmin(true)}
+                aria-label="Admin"
+                title="Admin dashboard"
+              >🔑</button>
             </div>
           </header>
 
@@ -2634,7 +2388,7 @@ export default function SwaraSlamApp() {
             </span>
           </div>
 
-          {/* ── Slam Score strip — set pips + fraction + level running total ── */}
+          {/* Score strip */}
           <div className="score-strip">
             <span className="score-label">Slam Score</span>
             <div className="score-pips">
@@ -2652,7 +2406,7 @@ export default function SwaraSlamApp() {
 
           <main className="ss-arena">
             <div className={"arena-field" + (phase === "active" ? " phase-active-border" : "")}>
-              {/* ── NEW: Mic listening indicator (top-right corner of field) ── */}
+              {/* Mic listening indicator */}
               {micActive && (
                 <div style={{position:"absolute",top:10,right:14,zIndex:2}}>
                   <div className="mic-status">
@@ -2668,14 +2422,24 @@ export default function SwaraSlamApp() {
                     key={i}
                     swara={sw}
                     state={getCardState(i)}
-                    // pitchMatched: only show green on the ACTIVE card while isMatch is true
-                    // Already-scored cards keep their normal state (no persistent green)
                     pitchMatched={i === activeCard && isMatch && phase === "active"}
                   />
                 ))}
               </div>
               <BeatDots beat={dotBeat} active={isPlaying} />
             </div>
+
+            {/* ── NEW: MicErrorBanner — shown when mic fails and user hasn't dismissed ── */}
+            {micError && !micErrorDismissed && (
+              <MicErrorBanner
+                message={micError}
+                onRetry={() => {
+                  setMicErrorDismissed(false);
+                  retryMic();
+                }}
+                onDismiss={() => setMicErrorDismissed(true)}
+              />
+            )}
 
             {isLocked && (
               <div style={{textAlign:"center",padding:"8px 0 4px"}}>
@@ -2715,7 +2479,7 @@ export default function SwaraSlamApp() {
         </div>
       )}
 
-      {/* Feedback Modal — rendered on top of everything */}
+      {/* Feedback Modal */}
       {showFeedback && (
         <FeedbackModal user={user} onClose={() => setShowFeedback(false)} />
       )}
@@ -2725,7 +2489,7 @@ export default function SwaraSlamApp() {
         <CookieBanner onAccept={handleCookieAccept} onLearnMore={handleCookieLearnMore} />
       )}
 
-      {/* Legal Modal (Terms & Privacy) */}
+      {/* Legal Modal */}
       {showLegalModal && (
         <LegalModal onClose={() => setShowLegalModal(false)} />
       )}
