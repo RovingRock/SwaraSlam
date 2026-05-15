@@ -1814,6 +1814,20 @@ export default function SwaraSlamApp() {
     else { engine.playLevelUpArp(); }
     setConfetti(true); setTimeout(() => setConfetti(false), 3200);
     if (nextLevel === 1) setHasCompletedLevel1(true);
+
+    // ── FREE PLAY COUNTER (moved here from onDone) ────────────────────────
+    // advanceSet level-complete branch is the single guaranteed execution
+    // path when all 5 sets finish — runs whether the audio engine fires
+    // the onDone callback or not. Count every completed Level 1 run.
+    if (lvl === 0) {
+      const currentPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+      const nextCount = currentPlays + 1;
+      localStorage.setItem('swaraslam_free_plays', String(nextCount));
+      freePlayCountRef.current = nextCount;
+      setFreePlayCount(nextCount);
+      console.log('[SwaraSlam] play counted:', nextCount, '/ limit:', FREE_PLAY_LIMIT);
+    }
+
     const requiresUnlock = !isPremiumRef.current && nextLevel >= 1;
     setLevelSummaryData({
       ...summary, levelTotal,
@@ -1864,26 +1878,7 @@ export default function SwaraSlamApp() {
         setPhase("done"); setIsPlaying(false); setActiveCard(-1); setDotBeat(-1);
         setMicActive(false); engine.stopDrone();
 
-        // ── FREE PLAY COUNTER — single source of truth ────────────────────
-        // Reads localStorage directly so the increment is always based on the
-        // true persisted value, never a potentially stale ref or React state.
-        // Writing back to localStorage atomically with state keeps all gates
-        // (startPlay entry, Replay button, PaywallScreen copy) consistent.
-        if (!isPremiumRef.current && levelRef.current === 0) {
-          const currentPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
-          const nextCount = currentPlays + 1;
-          localStorage.setItem('swaraslam_free_plays', nextCount);
-          // Mirror into React state + ref so UI re-renders with the new count.
-          freePlayCountRef.current = nextCount;
-          setFreePlayCount(nextCount);
-          if (nextCount > FREE_PLAY_LIMIT) {
-            setScore(0); scoreRef.current = 0;
-            scoredCardsRef.current = new Set(); setScoredCards(new Set());
-            setScreen("paywall");
-            return;
-          }
-        }
-
+        // Counter now lives in advanceSet level-complete branch (guaranteed path).
         advanceSet(levelRef.current, setNumRef.current);
       }
     );
