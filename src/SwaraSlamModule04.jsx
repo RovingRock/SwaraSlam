@@ -512,7 +512,14 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
       if (mode === "signup") {
         const { data, error: err } = await supabase.auth.signUp({
           email, password,
-          options: { emailRedirectTo: "https://swara-slam.vercel.app", data: { marketing_consent: marketingConsent } }
+          options: {
+            // Use window.location.origin so the confirmation link resolves
+            // correctly in every environment (local, staging, production)
+            // without hard-coding. Supabase appends the token; Vodien SMTP
+            // dispatches the email to the user's inbox.
+            emailRedirectTo: window.location.origin,
+            data: { marketing_consent: marketingConsent },
+          },
         });
         if (err) {
           if (err.message.includes("already registered") || err.message.includes("already exists") || err.message.includes("User already")) {
@@ -553,9 +560,17 @@ function AuthModal({ onClose, onAuthSuccess, onOpenLegal, preferredMode = "signu
     if (!email.trim()) { setError("Enter your email address above first."); return; }
     setLoading(true); setError(""); setMessage("");
     try {
-      const { error: err } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-        redirectTo: "https://swara-slam.vercel.app/reset-password",
-      });
+      // The profiles table does not expose an email column (email lives in
+      // auth.users which the anon key cannot query). The previous check was
+      // causing a 400 by filtering on a non-existent column.
+      //
+      // Supabase's resetPasswordForEmail is a safe no-op for unknown emails
+      // (it returns success without sending anything, preventing enumeration),
+      // so we trust Supabase's handling and proceed directly to the API call.
+      const { error: err } = await supabase.auth.resetPasswordForEmail(
+        email.trim(),
+        { redirectTo: window.location.origin + "/reset-password" }
+      );
       if (err) { setError(friendlyError(err)); return; }
       setMode("forgot-sent");
     } catch (err) { setError(friendlyError(err)); }
@@ -1024,14 +1039,29 @@ function LegalModal({ onClose }) {
 }
 
 // ─── Paywall Screen ───────────────────────────────────────────────────────────
+// Reads localStorage directly for the play count so the subtitle is always
+// accurate, even before React state has synced after a round completes.
 function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
   const btnBase = { fontFamily:"'DM Sans',sans-serif",fontSize:14,fontWeight:600,padding:"13px 24px",color:"#fff",border:"none",borderRadius:8,cursor:redirecting?"not-allowed":"pointer",width:"100%" };
   const isRedirecting = (priceId) => redirecting && redirectingPriceId === priceId;
+  // Read directly from localStorage — ground truth regardless of React timing
+  // and regardless of whether the Supabase profile fetch succeeded or failed.
+  // A profile 400 / load error must never drop this back to the 0-plays copy
+  // when the user has already played rounds (task spec fail-safe requirement).
+  const currentPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+  const remaining = Math.max(0, 5 - currentPlays);
+  // Priority order: locked copy → remaining copy → default copy.
+  // currentPlays is always authoritative; profile state is never consulted here.
+  const displayMessage = currentPlays >= 5
+    ? "You’ve mastered your first 5 sets! To continue your Riyaz and unlock all 4 levels, choose a plan below."
+    : currentPlays > 0
+      ? `You have [${remaining}] Free slam${remaining === 1 ? "" : "s"} remaining. To continue Swara slamming and unlock all levels, choose a plan below.`
+      : "Level 1 is free. Unlock chromatic swaras, advanced jumps, and three octaves with full access.";
   return (
     <div style={{width:"100%",maxWidth:480,margin:"0 auto",display:"flex",flexDirection:"column",alignItems:"center",gap:20,padding:"32px 16px"}}>
       <div style={{fontSize:44}}>🔒</div>
       <h2 style={{fontFamily:"'Cormorant Garamond',serif",fontSize:30,fontWeight:600,color:"#1C1A17",margin:0,textAlign:"center"}}>Unlock All 4 Levels</h2>
-      <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>Level 1 is free. Unlock chromatic swaras, advanced jumps, and three octaves with full access.</p>
+      <p style={{fontFamily:"'DM Sans',sans-serif",fontSize:14,color:"#6B6560",textAlign:"center",margin:0,maxWidth:360,lineHeight:1.6}}>{displayMessage}</p>
       <div style={{display:"flex",gap:16,flexWrap:"wrap",justifyContent:"center",width:"100%",marginTop:8}}>
         <div style={{background:"#fff",border:"1.5px solid #E5DFD3",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center"}}>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>24-HOUR PASS</div>
@@ -1416,6 +1446,24 @@ export default function SwaraSlamApp() {
   // ── NEW: micErrorDismissed — lets user hide the banner without retrying ───
   const [micErrorDismissed, setMicErrorDismissed] = useState(false);
 
+  // ── FREE PLAY LIMIT ────────────────────────────────────────────────────────
+  // freePlayCount: number of sets completed on Level 1 by a non-premium user.
+  // Incremented inside advanceSet whenever lvl === 0 and !isPremiumRef.current.
+  // When it reaches FREE_PLAY_LIMIT the paywall is shown with custom copy
+  // instead of allowing a 6th set to begin.
+  // A ref mirror (freePlayCountRef) is used inside the advanceSet callback
+  // so the closure always reads the latest value without needing it as a dep.
+  const FREE_PLAY_LIMIT = 5;
+  // localStorage persistence — survives page reloads and React re-mounts.
+  // The lazy initializer runs once; the ref is seeded from the same value
+  // so the onDone closure always reads the persisted count correctly.
+  const [freePlayCount, setFreePlayCount] = useState(() => {
+    return Number(localStorage.getItem('swaraslam_free_plays') || 0);
+  });
+  const freePlayCountRef = useRef(
+    Number(localStorage.getItem('swaraslam_free_plays') || 0)
+  );
+
   // Cumulative level scoring
   const [levelTotalScore,  setLevelTotalScore]  = useState(0);
   const levelTotalScoreRef = useRef(0);
@@ -1570,6 +1618,8 @@ export default function SwaraSlamApp() {
           // Webhook already updated the row — proceed normally
           setIsPremium(true); isPremiumRef.current = true;
           userRef.current = session.user; setUser(session.user);
+          setFreePlayCount(0); freePlayCountRef.current = 0;
+          localStorage.removeItem('swaraslam_free_plays'); // lift the gate permanently
           setConfetti(true); setTimeout(() => setConfetti(false), 3500);
           setScreen("premium-unlocked");
           setTimeout(() => setScreen("game"), 3500);
@@ -1584,6 +1634,8 @@ export default function SwaraSlamApp() {
           await forcePremiumUpdate(session.user.id);
           setIsPremium(true); isPremiumRef.current = true;
           userRef.current = session.user; setUser(session.user);
+          setFreePlayCount(0); freePlayCountRef.current = 0;
+          localStorage.removeItem('swaraslam_free_plays'); // lift the gate permanently
           setConfetti(true); setTimeout(() => setConfetti(false), 3500);
           setScreen("premium-unlocked");
           setTimeout(() => setScreen("game"), 3500);
@@ -1610,6 +1662,13 @@ export default function SwaraSlamApp() {
     });
 
     // ── 3. Auth state change listener ────────────────────────────────────
+    // FIX 1b — Email confirmation gate.
+    // onAuthStateChange fires SIGNED_IN for both confirmed and unconfirmed
+    // users (e.g. right after signUp when email confirm is ON, Supabase still
+    // fires SIGNED_IN but email_confirmed_at is null). We must NOT advance
+    // screen state for unconfirmed accounts — the user should see the
+    // "check your inbox" message in AuthModal until they click the link.
+    // PASSWORD_RECOVERY is exempt (confirmed status irrelevant for resets).
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === "PASSWORD_RECOVERY" && session?.user) {
         setUser(session.user); userRef.current = session.user;
@@ -1617,6 +1676,10 @@ export default function SwaraSlamApp() {
         return;
       }
       if (session?.user) {
+        // Only update app state for confirmed accounts.
+        // Unconfirmed users get the confirmation prompt in AuthModal;
+        // advancing them here would bypass the email verification flow.
+        if (!session.user.email_confirmed_at) return;
         setUser(session.user); userRef.current = session.user;
         loadProfile(session.user.id);
       } else {
@@ -1641,9 +1704,21 @@ export default function SwaraSlamApp() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadProfile = async (userId) => {
+    // Guard: userId must be a non-empty string. Anything else (undefined,
+    // null, object) would produce a 400 from Supabase PostgREST because
+    // the filter becomes "id=eq.undefined" or "id=eq.[object Object]".
+    const uid = String(userId || "").trim();
+    if (!uid) { console.warn("loadProfile: userId is empty — skipping fetch"); return false; }
     try {
-      const { data, error } = await supabase.from("profiles").select("*").eq("id", userId).single();
-      if (error || !data) return false;
+      // maybeSingle() returns { data: null, error: null } when no row exists,
+      // avoiding the "PGRST116 — multiple/no rows" error that .single() throws.
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", uid)
+        .maybeSingle();
+      if (error) { console.error("loadProfile query error:", error.message); return false; }
+      if (!data) return false;
       const lvl = Math.max(0, (data.current_level || 1) - 1);
       const sn  = Math.max(0, (data.current_set   || 1) - 1);
       const premium = data.is_premium || false;
@@ -1741,6 +1816,17 @@ export default function SwaraSlamApp() {
   }, [engine, saveProgress]);
 
   const startPlay = useCallback((replayCards) => {
+    // ── HARD GATE: free-play limit check before audio starts ─────────────
+    // Reads localStorage directly so this is always accurate regardless of
+    // React state timing, re-mounts, or ref drift. Only applies to Level 1
+    // non-premium sessions.
+    if (levelRef.current === 0 && !isPremiumRef.current) {
+      const currentPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+      if (currentPlays >= FREE_PLAY_LIMIT) {
+        setScreen("paywall");
+        return;
+      }
+    }
     engine.stopScheduler();
     const playCards = replayCards || generateCards(levelRef.current);
     if (!replayCards) setCards(playCards);
@@ -1768,6 +1854,27 @@ export default function SwaraSlamApp() {
       () => {
         setPhase("done"); setIsPlaying(false); setActiveCard(-1); setDotBeat(-1);
         setMicActive(false); engine.stopDrone();
+
+        // ── FREE PLAY COUNTER — single source of truth ────────────────────
+        // Reads localStorage directly so the increment is always based on the
+        // true persisted value, never a potentially stale ref or React state.
+        // Writing back to localStorage atomically with state keeps all gates
+        // (startPlay entry, Replay button, PaywallScreen copy) consistent.
+        if (!isPremiumRef.current && levelRef.current === 0) {
+          const currentPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+          const nextCount = currentPlays + 1;
+          localStorage.setItem('swaraslam_free_plays', nextCount);
+          // Mirror into React state + ref so UI re-renders with the new count.
+          freePlayCountRef.current = nextCount;
+          setFreePlayCount(nextCount);
+          if (nextCount > FREE_PLAY_LIMIT) {
+            setScore(0); scoreRef.current = 0;
+            scoredCardsRef.current = new Set(); setScoredCards(new Set());
+            setScreen("paywall");
+            return;
+          }
+        }
+
         advanceSet(levelRef.current, setNumRef.current);
       }
     );
@@ -1838,6 +1945,8 @@ export default function SwaraSlamApp() {
     setLevelTotalScore(0); levelTotalScoreRef.current = 0;
     setGrandSlamScore(0); grandSlamScoreRef.current = 0;
     setMicActive(false); setLevelSummaryData(null);
+    setFreePlayCount(0); freePlayCountRef.current = 0;
+    localStorage.removeItem('swaraslam_free_plays'); // clear gate on logout
     setScreen("home");
   }, [stopPlay]);
 
@@ -2167,6 +2276,16 @@ export default function SwaraSlamApp() {
               setScore(0); scoreRef.current = 0;
               setLevelTotalScore(0); levelTotalScoreRef.current = 0;
               setPhase("idle"); setActiveCard(-1);
+              // Hard gate: read localStorage directly to guarantee correctness
+              // regardless of ref or state timing at the point this is tapped.
+              if (!isPremiumRef.current) {
+                const currentPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+                if (currentPlays >= FREE_PLAY_LIMIT) {
+                  setScreen("paywall");
+                  return;
+                }
+              }
+              // Under the limit — stay on game screen (already on "game")
             }}>← Replay Level 1</button>
           )}
         </div>
@@ -2244,6 +2363,10 @@ export default function SwaraSlamApp() {
           </div>
           <p className="home-sub">Swara expertise for Vocalists and Instrumentalists</p>
           <button className="primary-btn" style={{marginTop:8}} onClick={() => {
+            // Persistent gate: free user who has used all plays goes to paywall
+            if (!user && freePlayCount >= FREE_PLAY_LIMIT) {
+              setScreen("paywall"); return;
+            }
             if (user) { setScreen("ready"); }
             else { setAuthMode("signup"); setScreen("auth"); }
           }}>Start Playing</button>
@@ -2252,9 +2375,19 @@ export default function SwaraSlamApp() {
             <span style={{color:"#9A7B50",fontSize:11}}>•</span>
             {user
               ? <button className="ghost-btn" onClick={handleLogout}>Log out ({user.email.split("@")[0]})</button>
-              : <button className="ghost-btn" onClick={() => { setAuthMode("login"); setScreen("auth"); }}>Already Slamming? Sign In</button>
+              : <button className="ghost-btn" onClick={() => { setAuthMode("login"); setScreen("auth"); }}>Sign-In</button>
             }
           </div>
+          {/* Unlock all levels — shown to unauthenticated or non-premium free users */}
+          {(!user || !isPremium) && (
+            <button
+              className="ghost-btn"
+              style={{marginTop:2,letterSpacing:".06em"}}
+              onClick={() => setScreen("paywall")}
+            >
+              Unlock all levels
+            </button>
+          )}
         </div>
       )}
 
@@ -2314,15 +2447,24 @@ export default function SwaraSlamApp() {
       {/* PAYWALL */}
       {screen === "paywall" && (
         <div className="screen" style={{justifyContent:"flex-start",paddingTop:32,overflowY:"auto",gap:0}}>
-          <PaywallScreen onCheckout={handleStripeCheckout} redirecting={paywallRedirecting} redirectingPriceId={redirectingPriceId} />
-          <button className="ghost-btn" style={{marginTop:4}} onClick={() => {
-            setLevel(0); setSetNum(0); setCards(generateCards(0)); setCurrentCards(null);
-            setPhase("idle"); setActiveCard(-1);
-            setScore(0); scoreRef.current = 0;
-            setLevelTotalScore(0); levelTotalScoreRef.current = 0;
-            setMicActive(false); setLevelSummaryData(null);
-            setScreen("game");
-          }}>← Back to Level 1</button>
+          {/* PaywallScreen reads localStorage directly — no contextMessage prop needed */}
+          <PaywallScreen
+            onCheckout={handleStripeCheckout}
+            redirecting={paywallRedirecting}
+            redirectingPriceId={redirectingPriceId}
+          />
+          {/* Back link: visible while plays remain (freePlayCount mirrors localStorage).
+               Auth guard: unauthenticated users go to home, not the game loop. */}
+          {(!isPremium && freePlayCount < FREE_PLAY_LIMIT) && (
+            <button className="ghost-btn" style={{marginTop:4}} onClick={() => {
+              setLevel(0); setSetNum(0); setCards(generateCards(0)); setCurrentCards(null);
+              setPhase("idle"); setActiveCard(-1);
+              setScore(0); scoreRef.current = 0;
+              setLevelTotalScore(0); levelTotalScoreRef.current = 0;
+              setMicActive(false); setLevelSummaryData(null);
+              setScreen(user ? "game" : "home");
+            }}>← Back to Level 1</button>
+          )}
         </div>
       )}
 
@@ -2340,7 +2482,11 @@ export default function SwaraSlamApp() {
             <div className="ss-header-actions">
               {user && (
                 <div className="user-chip">
-                  <span className="user-chip-name"><span className="user-chip-crown">♛</span>{user.email.split("@")[0]}</span>
+                  <span className="user-chip-name">
+                    {/* Crown only shown when the DB confirms is_premium === true */}
+                    {isPremium && <span className="user-chip-crown">♛</span>}
+                    {user.email.split("@")[0]}
+                  </span>
                   <button className="user-chip-logout" onClick={handleLogout}>Log out</button>
                 </div>
               )}
