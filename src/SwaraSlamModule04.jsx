@@ -2010,37 +2010,39 @@ export default function SwaraSlamApp() {
   const handleStripeCheckout = useCallback(async (priceId) => {
     setPaywallRedirecting(true); setRedirectingPriceId(priceId);
     try {
-      const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession();
-      const session = refreshData?.session;
-      if (refreshErr || !session?.access_token) {
-        const { data: { session: fallback }, error: se } = await supabase.auth.getSession();
-        if (se || !fallback?.access_token) {
-          setPaywallRedirecting(false); setRedirectingPriceId(null);
-          setScreen("auth"); return;
-        }
-        return doCheckout(priceId, fallback.access_token);
+      // Use getSession() only — never refreshSession() here.
+      // refreshSession() can fire SIGNED_OUT through onAuthStateChange if the
+      // token is stale, which clears user state and makes the app appear to
+      // log the user out before the Stripe redirect even happens.
+      const { data: { session }, error } = await supabase.auth.getSession();
+      if (error || !session?.access_token) {
+        // No valid session — send to auth instead of crashing
+        setPaywallRedirecting(false); setRedirectingPriceId(null);
+        setScreen("auth"); return;
       }
-      return doCheckout(priceId, session.access_token);
+      const token = session.access_token;
+      const res = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/create-checkout`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`,
+          },
+          body: JSON.stringify({ priceId }),
+        }
+      );
+      if (!res.ok) {
+        const errBody = await res.text();
+        throw new Error(`Server error: ${res.status} — ${errBody}`);
+      }
+      const data = await res.json();
+      if (!data.url) throw new Error("No checkout URL received from server");
+      // Navigate to Stripe — page will unload here, which is expected.
+      window.location.href = data.url;
     } catch (err) {
       alert(`Payment setup failed: ${err.message}`);
       setPaywallRedirecting(false); setRedirectingPriceId(null);
-    }
-
-    async function doCheckout(priceId, token) {
-      try {
-        const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/create-checkout`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-          body: JSON.stringify({ priceId }),
-        });
-        if (!res.ok) { const errBody = await res.text(); throw new Error(`Server error: ${res.status} — ${errBody}`); }
-        const data = await res.json();
-        if (!data.url) throw new Error("No checkout URL received from server");
-        window.location.href = data.url;
-      } catch (err) {
-        alert(`Payment setup failed: ${err.message}`);
-        setPaywallRedirecting(false); setRedirectingPriceId(null);
-      }
     }
   }, []);
 
