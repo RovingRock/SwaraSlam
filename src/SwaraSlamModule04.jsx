@@ -2017,19 +2017,38 @@ export default function SwaraSlamApp() {
   const handleStripeCheckout = useCallback(async (priceId) => {
     setPaywallRedirecting(true); setRedirectingPriceId(priceId);
     try {
-      // Resolve user identity — works across browser, Android PWA, and iOS/Mac PWA.
-      // The Mac Safari PWA runs in an isolated storage context: when the confirmation
-      // email link opens in Safari, the session is stored in Safari's partition, not
-      // the PWA's. Bearer token approaches all fail because the PWA storage is empty.
-      //
-      // Solution: identify the user from React state (userRef) which is always
-      // populated in memory during this session, then send user ID + anon key.
-      // The Edge Function authenticates via service role on the server side.
-      const userId = userRef.current?.id;
-      const userEmail = userRef.current?.email;
+      // Token resolution — works in both browser and PWA/installed contexts.
+      // Priority order:
+      //   1. sessionRef.current  — full session cached in memory at login time.
+      //      Always available in PWA where localStorage may be partitioned.
+      //   2. getSession()        — browser fallback if sessionRef was never set.
+      //   3. localStorage direct — last resort raw key read.
+      let token = null;
 
-      if (!userId || !userEmail) {
-        // No user in memory — must sign in inside the app first
+      // 1. In-memory session cache (reliable in PWA)
+      if (sessionRef.current?.access_token) {
+        token = sessionRef.current.access_token;
+      }
+
+      // 2. Supabase client getSession() (reliable in browser)
+      if (!token) {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session?.access_token) {
+          token = session.access_token;
+          sessionRef.current = session; // backfill cache
+        }
+      }
+
+      // 3. Raw localStorage read (last resort)
+      if (!token) {
+        try {
+          const STORAGE_KEY = `sb-${import.meta.env.VITE_SUPABASE_URL.split("//")[1].split(".")[0]}-auth-token`;
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) token = JSON.parse(raw)?.access_token || null;
+        } catch (_) { /* parse failed */ }
+      }
+
+      if (!token) {
         setPaywallRedirecting(false); setRedirectingPriceId(null);
         setScreen("auth"); return;
       }
@@ -2040,10 +2059,7 @@ export default function SwaraSlamApp() {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            // Send anon key as the API key — Edge Function uses service role to verify
-            "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-            "x-user-id": userId,
-            "x-user-email": userEmail,
+            "Authorization": `Bearer ${token}`,
           },
           body: JSON.stringify({ priceId }),
         }
