@@ -2011,17 +2011,32 @@ export default function SwaraSlamApp() {
   const handleStripeCheckout = useCallback(async (priceId) => {
     setPaywallRedirecting(true); setRedirectingPriceId(priceId);
     try {
-      // Use getSession() only — never refreshSession() here.
-      // refreshSession() can fire SIGNED_OUT through onAuthStateChange if the
-      // token is stale, which clears user state and makes the app appear to
-      // log the user out before the Stripe redirect even happens.
-      const { data: { session }, error } = await supabase.auth.getSession();
-      if (error || !session?.access_token) {
-        // No valid session — send to auth instead of crashing
+      // Read the raw token directly from the Supabase localStorage key.
+      // This works in both browser and PWA/installed contexts because it
+      // bypasses the Supabase client entirely — no network call, no auth events.
+      // The key format is: sb-<project-ref>-auth-token
+      const STORAGE_KEY = `sb-${import.meta.env.VITE_SUPABASE_URL.split("//")[1].split(".")[0]}-auth-token`;
+      let token = null;
+
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          token = parsed?.access_token || null;
+        }
+      } catch (_) { /* storage parse failed — fall through */ }
+
+      // Fallback: use getSession() if localStorage read failed
+      if (!token) {
+        const { data: { session } } = await supabase.auth.getSession();
+        token = session?.access_token || null;
+      }
+
+      if (!token) {
         setPaywallRedirecting(false); setRedirectingPriceId(null);
         setScreen("auth"); return;
       }
-      const token = session.access_token;
+
       const res = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/create-checkout`,
         {
@@ -2039,7 +2054,6 @@ export default function SwaraSlamApp() {
       }
       const data = await res.json();
       if (!data.url) throw new Error("No checkout URL received from server");
-      // Navigate to Stripe — page will unload here, which is expected.
       window.location.href = data.url;
     } catch (err) {
       alert(`Payment setup failed: ${err.message}`);
