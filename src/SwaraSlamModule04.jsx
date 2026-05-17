@@ -1062,9 +1062,9 @@ function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#9A7B50",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>24-HOUR PASS</div>
           <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:38,fontWeight:600,color:"#1C1A17",lineHeight:1,marginBottom:4}}>$1.99</div>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:"#6B6560",marginBottom:16}}>Try all levels for a day</div>
-          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpDNCevGY65XqMdTh1x4Qb")}
-            style={{...btnBase,background:"#9A7B50",opacity:isRedirecting("price_1TVpDNCevGY65XqMdTh1x4Qb")?0.6:redirecting?0.3:1}}>
-            {isRedirecting("price_1TVpDNCevGY65XqMdTh1x4Qb") ? "Redirecting…" : "Get 24-Hour Access"}
+          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpF4CevGY65XqM13lijglp")}
+            style={{...btnBase,background:"#9A7B50",opacity:isRedirecting("price_1TVpF4CevGY65XqM13lijglp")?0.6:redirecting?0.3:1}}>
+            {isRedirecting("price_1TVpF4CevGY65XqM13lijglp") ? "Redirecting…" : "Get 24-Hour Access"}
           </button>
         </div>
         <div style={{background:"linear-gradient(135deg,rgba(192,95,47,0.08),rgba(154,123,80,0.08))",border:"2px solid #C05F2F",borderRadius:14,padding:"22px 20px",flex:"1 1 180px",maxWidth:220,textAlign:"center",position:"relative"}}>
@@ -1072,9 +1072,9 @@ function PaywallScreen({ onCheckout, redirecting, redirectingPriceId }) {
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:11,color:"#C05F2F",fontWeight:700,letterSpacing:".12em",marginBottom:8}}>LIFETIME ACCESS</div>
           <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:38,fontWeight:600,color:"#C05F2F",lineHeight:1,marginBottom:4}}>$9.99</div>
           <div style={{fontFamily:"'DM Sans',sans-serif",fontSize:12,color:"#6B6560",marginBottom:16}}>Unlock forever</div>
-          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpBKCevGY65XqMA79vW9Rt")}
-            style={{...btnBase,background:"#C05F2F",boxShadow:"0 4px 12px rgba(192,95,47,0.3)",opacity:isRedirecting("price_1TVpBKCevGY65XqMA79vW9Rt")?0.6:redirecting?0.3:1}}>
-            {isRedirecting("price_1TVpBKCevGY65XqMA79vW9Rt") ? "Redirecting…" : "✦ Get Lifetime Access"}
+          <button disabled={redirecting} onClick={() => onCheckout("price_1TVpF0CevGY65XqMgLukQcWc")}
+            style={{...btnBase,background:"#C05F2F",boxShadow:"0 4px 12px rgba(192,95,47,0.3)",opacity:isRedirecting("price_1TVpF0CevGY65XqMgLukQcWc")?0.6:redirecting?0.3:1}}>
+            {isRedirecting("price_1TVpF0CevGY65XqMgLukQcWc") ? "Redirecting…" : "✦ Get Lifetime Access"}
           </button>
         </div>
       </div>
