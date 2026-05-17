@@ -63,7 +63,7 @@ function usePitchDetection({ isActive, targetFreq }) {
     let rms = 0;
     for (let i = 0; i < buffer.length; i++) rms += buffer[i] * buffer[i];
     rms = Math.sqrt(rms / buffer.length);
-    if (rms < 0.012) return null;
+    if (rms < 0.006) return null;
 
     const n = buffer.length;
     let bestOffset = -1;
@@ -1308,7 +1308,7 @@ function useAudioEngine() {
   const startDrone = useCallback((freq) => {
     stopDrone();
     const ctx = getCtx(), master = ctx.createGain();
-    master.gain.setValueAtTime(0.28, ctx.currentTime);
+    master.gain.setValueAtTime(0.38, ctx.currentTime);
     master.connect(ctx.destination);
     [[1,.28],[2,.11],[3,.06],[5,.035]].forEach(([m,a]) => {
       const o = ctx.createOscillator(), g = ctx.createGain();
@@ -1328,8 +1328,8 @@ function useAudioEngine() {
   const playGuruNote = useCallback((freq, t) => {
     const ctx = getCtx(), master = ctx.createGain();
     master.gain.setValueAtTime(0, t);
-    master.gain.linearRampToValueAtTime(0.24, t + 0.035);
-    master.gain.setValueAtTime(0.19, t + 0.10);
+    master.gain.linearRampToValueAtTime(0.13, t + 0.035);
+master.gain.setValueAtTime(0.10, t + 0.10);
     master.gain.linearRampToValueAtTime(0, t + NOTE_DUR);
     master.connect(ctx.destination);
     [[1,1.0],[2,0.26],[3,0.07]].forEach(([m,a]) => {
