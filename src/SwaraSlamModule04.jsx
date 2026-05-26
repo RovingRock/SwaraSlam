@@ -46,6 +46,7 @@ export default function SwaraSlamApp() {
 
   // Game
   const [isPlaying,    setIsPlaying]    = useState(false);
+  const isPlayingRef = useRef(false);
   const [droneOn,      setDroneOn]      = useState(true);
   const [saIndex,      setSaIndex]      = useState(0);
   const [level,        setLevel]        = useState(0);
@@ -72,6 +73,10 @@ export default function SwaraSlamApp() {
 
   // ── NEW: micErrorDismissed — lets user hide the banner without retrying ───
   const [micErrorDismissed, setMicErrorDismissed] = useState(false);
+
+  // ── DEBUG: ?debug=1 overlay (temporary) ──────────────────────────────────
+  // Holds the snapshot returned by engine.getDebugInfo() — null when overlay off.
+  const [debugInfo, setDebugInfo] = useState(null);
 
   // ── FREE PLAY LIMIT ────────────────────────────────────────────────────────
   // freePlayCount: number of sets completed on Level 1 by a non-premium user.
@@ -448,6 +453,16 @@ export default function SwaraSlamApp() {
 
   useEffect(() => () => { engine.stopScheduler(); engine.stopDrone(); }, []);
 
+  // ── DEBUG: polls engine state every 500ms when ?debug=1 is in URL ─────────
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("debug") !== "1") return;
+    const update = () => setDebugInfo(engine.getDebugInfo());
+    update();
+    const id = setInterval(update, 500);
+    return () => clearInterval(id);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     if (window.matchMedia("(display-mode: standalone)").matches) return;
     if (localStorage.getItem("installBannerDismissed")) return;
@@ -557,7 +572,7 @@ export default function SwaraSlamApp() {
     setScoredCards(new Set());
     const effectiveBpm = manualBpmRef.current ? bpmRef.current : autoBpm;
     if (!manualBpmRef.current) setBpm(effectiveBpm);
-    setPhase("leadin"); setActiveCard(-1); setDotBeat(-1); setIsPlaying(true);
+    setPhase("leadin"); setActiveCard(-1); setDotBeat(-1); setIsPlaying(true); isPlayingRef.current = true;
     setMicActive(true);
     if (droneOn) engine.startDrone(SA_PITCHES[saIdxRef.current].freq);
     engine.scheduleBeats(effectiveBpm, LEAD_IN_BEATS + ACTIVE_BEATS,
@@ -572,10 +587,12 @@ export default function SwaraSlamApp() {
         }
       },
       () => {
-        setPhase("done"); setIsPlaying(false); setDotBeat(-1);
+        setPhase("done"); setIsPlaying(false); isPlayingRef.current = false; setDotBeat(-1);
         setTimeout(() => {
           setActiveCard(-1);
-          setMicActive(false); engine.stopDrone();
+          setMicActive(false);
+          // Only stop drone if a new set hasn't already restarted it
+          if (!isPlayingRef.current) engine.stopDrone();
         }, 1200);
 
         // Counter now lives in advanceSet level-complete branch (guaranteed path).
@@ -586,7 +603,7 @@ export default function SwaraSlamApp() {
 
   const stopPlay = useCallback(() => {
     engine.stopScheduler(); engine.stopDrone();
-    setIsPlaying(false); setPhase("idle"); setActiveCard(-1); setDotBeat(-1);
+    setIsPlaying(false); isPlayingRef.current = false; setPhase("idle"); setActiveCard(-1); setDotBeat(-1);
     setMicActive(false);
     setScore(0); scoreRef.current = 0;
     scoredCardsRef.current = new Set();
@@ -594,7 +611,7 @@ export default function SwaraSlamApp() {
   }, [engine]);
 
   const handleRetry = useCallback(() => {
-    if (isPlaying) { engine.stopScheduler(); engine.stopDrone(); setIsPlaying(false); setMicActive(false); }
+    if (isPlaying) { engine.stopScheduler(); engine.stopDrone(); setIsPlaying(false); isPlayingRef.current = false; setMicActive(false); }
     engine.warmUp();
     setTimeout(() => startPlay(currentCards || cards), 80);
   }, [isPlaying, engine, currentCards, cards, startPlay]);
@@ -761,6 +778,24 @@ export default function SwaraSlamApp() {
     <>
       <Confetti active={confetti} />
       <BpmFlash bpm={manualBpm ? bpm : autoBpm} visible={bpmFlash} />
+
+      {/* ── DEBUG overlay (?debug=1) — remove after mobile audio fix ── */}
+      {debugInfo && (
+        <div style={{
+          position: "fixed", bottom: 0, left: 0,
+          background: "#000", color: "#fff",
+          fontFamily: "monospace", fontSize: 10,
+          padding: 10, zIndex: 9999, opacity: 0.85,
+          lineHeight: 1.4, pointerEvents: "none", whiteSpace: "pre",
+        }}>
+          <div>ctx.state:        {debugInfo.ctxState}</div>
+          <div>ctx.currentTime:  {debugInfo.ctxTime.toFixed(3)}</div>
+          <div>schedule start:   {debugInfo.scheduleStartTime.toFixed(3)}</div>
+          <div>beats scheduled:  {debugInfo.scheduledCount}</div>
+          <div>phase:            {phase}</div>
+          <div>isSafari:         {String(debugInfo.isSafari)}</div>
+        </div>
+      )}
 
       {/* ── NEW: Admin Dashboard overlay ── */}
       {showAdmin && (

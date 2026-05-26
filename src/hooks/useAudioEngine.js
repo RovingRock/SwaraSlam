@@ -8,6 +8,9 @@ export default function useAudioEngine() {
   const schedTimerRef = useRef(null);
   const nextBeatRef   = useRef(0);
   const beatCountRef  = useRef(0);
+  // ── DEBUG: tracking for the ?debug=1 overlay (temporary) ──────────────────
+  const scheduleStartTimeRef = useRef(0);
+  const scheduledCountRef    = useRef(0);
 
   const getCtx = useCallback(() => {
     if (!ctxRef.current || ctxRef.current.state === "closed")
@@ -99,6 +102,9 @@ export default function useAudioEngine() {
 
   const scheduleBeats = useCallback((bpm, totalBeats, onBeat, onDone) => {
     const ctx = getCtx(), spb = 60 / bpm;
+    // DEBUG: capture ctx.currentTime at the moment scheduleBeats was called
+    scheduleStartTimeRef.current = ctx.currentTime;
+    scheduledCountRef.current    = 0;
     const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     const schedAhead = isSafari ? 0.40 : 0.25;
     const lookAhead  = isSafari ? 60   : 40;
@@ -118,6 +124,7 @@ export default function useAudioEngine() {
         setTimeout(() => onBeat(cb % 4, isDown, cs, t), delay);
         nextBeatRef.current += spb; beatCountRef.current++; scheduled++;
       }
+      scheduledCountRef.current = scheduled; // DEBUG: mirror to ref for overlay
       if (scheduled < totalBeats) {
         schedTimerRef.current = setTimeout(tick, lookAhead);
       } else {
@@ -129,7 +136,11 @@ export default function useAudioEngine() {
     beatCountRef.current = 0;
     const _waitForClock = () => {
       if (ctx.currentTime > 0) {
-        nextBeatRef.current = ctx.currentTime + 0.08;
+        // Add extra 200ms buffer on mobile to let audio hardware stabilise
+        // before the first beat fires. This prevents the first-card glitch.
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+        const startOffset = isMobile ? 0.30 : 0.08;
+        nextBeatRef.current = ctx.currentTime + startOffset;
         tick();
       } else {
         setTimeout(_waitForClock, 10);
@@ -203,5 +214,13 @@ export default function useAudioEngine() {
   }, [getCtx]);
 
   const getAudioContext = useCallback(() => getCtx(), [getCtx]);
-  return { startDrone, stopDrone, scheduleBeats, stopScheduler, resumeCtx, updateDroneFreq, playGuruNote, playSetDing, playLevelUpArp, playGrandSlamFanfare, getAudioContext, warmUp };
+  // DEBUG: snapshot of engine state for the ?debug=1 overlay (temporary)
+  const getDebugInfo = useCallback(() => ({
+    ctxState:          ctxRef.current?.state ?? "none",
+    ctxTime:           ctxRef.current?.currentTime ?? 0,
+    scheduleStartTime: scheduleStartTimeRef.current,
+    scheduledCount:    scheduledCountRef.current,
+    isSafari:          /^((?!chrome|android).)*safari/i.test(navigator.userAgent),
+  }), []);
+  return { startDrone, stopDrone, scheduleBeats, stopScheduler, resumeCtx, updateDroneFreq, playGuruNote, playSetDing, playLevelUpArp, playGrandSlamFanfare, getAudioContext, warmUp, getDebugInfo };
 }
