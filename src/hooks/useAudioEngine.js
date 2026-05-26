@@ -31,13 +31,20 @@ export default function useAudioEngine() {
   }, []);
 
   const stopDrone = useCallback(() => {
+    droneFreqRef.current = 0;
     droneNodesRef.current.forEach(n => { try { n.stop(); n.disconnect(); } catch(e){} });
     droneNodesRef.current = [];
+    // Remove onstatechange so it does not rebuild after intentional stop
+    if (ctxRef.current) ctxRef.current.onstatechange = null;
   }, []);
 
-  const startDrone = useCallback((freq) => {
-    stopDrone();
-    const ctx = getCtx(), master = ctx.createGain();
+  const droneFreqRef = useRef(0);
+
+  const _buildDroneNodes = useCallback((ctx, freq) => {
+    // Stop any existing nodes first
+    droneNodesRef.current.forEach(n => { try { n.stop(); n.disconnect(); } catch(e){} });
+    droneNodesRef.current = [];
+    const master = ctx.createGain();
     master.gain.setValueAtTime(0.38, ctx.currentTime);
     master.connect(ctx.destination);
     [[1,.28],[2,.11],[3,.06],[5,.035]].forEach(([m,a]) => {
@@ -53,7 +60,26 @@ export default function useAudioEngine() {
       g.gain.setValueAtTime(a, ctx.currentTime); o.connect(g); g.connect(master); o.start();
       droneNodesRef.current.push(o);
     });
-  }, [stopDrone, getCtx]);
+  }, []);
+
+  const startDrone = useCallback((freq) => {
+    droneFreqRef.current = freq;
+    stopDrone();
+    const ctx = getCtx();
+    _buildDroneNodes(ctx, freq);
+    // iOS WebKit kills oscillator nodes when AudioContext is interrupted by touch.
+    // onstatechange detects the resume and rebuilds drone nodes automatically.
+    ctx.onstatechange = () => {
+      if (ctx.state === "running" && droneFreqRef.current > 0) {
+        // Small delay to let iOS fully settle after resume
+        setTimeout(() => {
+          if (ctx.state === "running" && droneFreqRef.current > 0) {
+            _buildDroneNodes(ctx, droneFreqRef.current);
+          }
+        }, 50);
+      }
+    };
+  }, [stopDrone, getCtx, _buildDroneNodes]);
 
   const playGuruNote = useCallback((freq, t) => {
     const ctx = getCtx(), master = ctx.createGain();
