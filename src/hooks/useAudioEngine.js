@@ -15,6 +15,25 @@ export default function useAudioEngine() {
     return ctxRef.current;
   }, []);
 
+  const warmUp = useCallback(() => {
+    // Create context if needed — must happen synchronously in user gesture
+    if (!ctxRef.current || ctxRef.current.state === "closed") {
+      ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    // Resume synchronously — Safari honours this when called in gesture
+    if (ctxRef.current.state === "suspended") {
+      ctxRef.current.resume().catch(() => {});
+    }
+    // Play a silent buffer — this is the standard iOS unlock trick
+    // Forces Safari to fully activate the audio hardware
+    const ctx = ctxRef.current;
+    const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(0);
+  }, []);
+
   const stopDrone = useCallback(() => {
     droneNodesRef.current.forEach(n => { try { n.stop(); n.disconnect(); } catch(e){} });
     droneNodesRef.current = [];
@@ -22,66 +41,65 @@ export default function useAudioEngine() {
 
   const startDrone = useCallback((freq) => {
     stopDrone();
-    const ctx = getCtx(), master = ctx.createGain();
-    master.gain.setValueAtTime(0.22, ctx.currentTime);
+    const ctx = getCtx();
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0, ctx.currentTime);
+    master.gain.linearRampToValueAtTime(0.32, ctx.currentTime + 0.5);
     master.connect(ctx.destination);
     [[1,.28],[2,.11],[3,.06],[5,.035]].forEach(([m,a]) => {
       const o = ctx.createOscillator(), g = ctx.createGain();
-      o.type = "sine"; o.frequency.setValueAtTime(freq*m, ctx.currentTime);
-      g.gain.setValueAtTime(a, ctx.currentTime); o.connect(g); g.connect(master); o.start();
+      o.type = "sine";
+      o.frequency.setValueAtTime(freq * m, ctx.currentTime);
+      g.gain.setValueAtTime(a, ctx.currentTime);
+      o.connect(g); g.connect(master); o.start();
       droneNodesRef.current.push(o);
     });
     const pf = freq * 1.5;
     [[1,.07],[2,.03]].forEach(([m,a]) => {
       const o = ctx.createOscillator(), g = ctx.createGain();
-      o.type = "sine"; o.frequency.setValueAtTime(pf*m, ctx.currentTime);
-      g.gain.setValueAtTime(a, ctx.currentTime); o.connect(g); g.connect(master); o.start();
+      o.type = "sine";
+      o.frequency.setValueAtTime(pf * m, ctx.currentTime);
+      g.gain.setValueAtTime(a, ctx.currentTime);
+      o.connect(g); g.connect(master); o.start();
       droneNodesRef.current.push(o);
     });
   }, [stopDrone, getCtx]);
 
   const playGuruNote = useCallback((freq, t) => {
-    const ctx = getCtx(), master = ctx.createGain();
-    // Soft attack, hold, gentle release — harmonium-like envelope
+    const ctx = getCtx();
+    if (ctx.state !== "running") return;
+    // Build graph: oscillators → gainNodes → master → filter → destination
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(freq * 6, t);
+    filter.Q.setValueAtTime(0.7, t);
+    filter.connect(ctx.destination);
+    const master = ctx.createGain();
     master.gain.setValueAtTime(0, t);
-    master.gain.linearRampToValueAtTime(0.11, t + 0.08);
-    master.gain.setValueAtTime(0.09, t + 0.18);
+    master.gain.linearRampToValueAtTime(0.18, t + 0.06);
+    master.gain.setValueAtTime(0.15, t + 0.20);
     master.gain.linearRampToValueAtTime(0, t + NOTE_DUR);
-    master.connect(ctx.destination);
-    // Harmonium harmonic series: fundamental + warm overtones
-    // [multiplier, amplitude] — more overtones than before,
-    // with a slight detune on upper harmonics for warmth
+    master.connect(filter);
     [
-      [1,   1.00],   // fundamental
-      [2,   0.55],   // octave — strong in harmonium
-      [3,   0.25],   // fifth above octave
-      [4,   0.14],   // two octaves
-      [5,   0.08],   // major third above two octaves
-      [6,   0.04],   // fifth above two octaves
+      [1, 1.00],
+      [2, 0.50],
+      [3, 0.22],
+      [4, 0.10],
+      [5, 0.06],
     ].forEach(([m, a]) => {
       const o = ctx.createOscillator(), g = ctx.createGain();
-      o.type = "triangle";  // triangle wave is warmer/softer than sine
-      // Slight detune on upper harmonics for organic warmth
-      const detuneCents = m > 2 ? (m % 2 === 0 ? 3 : -3) : 0;
+      o.type = "triangle";
       o.frequency.setValueAtTime(freq * m, t);
-      o.detune.setValueAtTime(detuneCents, t);
-      g.gain.setValueAtTime(a * 0.13, t);
+      o.detune.setValueAtTime(m > 2 ? (m % 2 === 0 ? 3 : -3) : 0, t);
+      g.gain.setValueAtTime(a * 0.18, t);
       o.connect(g); g.connect(master);
       o.start(t); o.stop(t + NOTE_DUR + 0.05);
     });
-    // Add a low-pass filter to soften high frequencies — key for harmonium feel
-    const filter = ctx.createBiquadFilter();
-    filter.type = "lowpass";
-    filter.frequency.setValueAtTime(freq * 7, t);
-    filter.Q.setValueAtTime(0.8, t);
-    master.disconnect();
-    master.connect(filter);
-    filter.connect(ctx.destination);
   }, [getCtx]);
 
   const scheduleBeats = useCallback((bpm, totalBeats, onBeat, onDone) => {
     const ctx = getCtx(), spb = 60 / bpm;
-    const schedAhead = 0.12, lookAhead = 25;
+    const schedAhead = 0.25, lookAhead = 40;
     let scheduled = 0;
     const tick = () => {
       while (nextBeatRef.current < ctx.currentTime + schedAhead && scheduled < totalBeats) {
@@ -173,5 +191,6 @@ export default function useAudioEngine() {
     });
   }, [getCtx]);
 
-  return { startDrone, stopDrone, scheduleBeats, stopScheduler, resumeCtx, updateDroneFreq, playGuruNote, playSetDing, playLevelUpArp, playGrandSlamFanfare };
+  const getAudioContext = useCallback(() => getCtx(), [getCtx]);
+  return { startDrone, stopDrone, scheduleBeats, stopScheduler, resumeCtx, updateDroneFreq, playGuruNote, playSetDing, playLevelUpArp, playGrandSlamFanfare, getAudioContext, warmUp };
 }

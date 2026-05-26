@@ -223,6 +223,12 @@ export default function SwaraSlamApp() {
         userRef.current = sessionUser; setUser(sessionUser);
         setFreePlayCount(0); freePlayCountRef.current = 0;
         localStorage.removeItem('swaraslam_free_plays');
+        if (sessionUser) {
+          supabase.from('profiles')
+            .update({ free_plays_used: 0 })
+            .eq('id', sessionUser.id)
+            .then(() => {});
+        }
         setConfetti(true); setTimeout(() => setConfetti(false), 3500);
         setScreen("premium-unlocked");
         setTimeout(() => setScreen("game"), 3500);
@@ -402,10 +408,20 @@ export default function SwaraSlamApp() {
       if (!premium && user?.id) {
         const { data: profile } = await supabaseAdmin
           .from("profiles")
-          .select("is_premium")
+          .select("is_premium, free_plays_used")
           .eq("id", user.id)
           .maybeSingle();
         if (profile?.is_premium === true) premium = true;
+        // Restore free play count from Supabase — prevents cross-device bypass
+        if (profile && profile.free_plays_used > 0) {
+          const localPlays = Number(localStorage.getItem('swaraslam_free_plays') || 0);
+          const serverPlays = profile.free_plays_used || 0;
+          // Always use the higher of local vs server — prevents gaming the system
+          const truePlays = Math.max(localPlays, serverPlays);
+          localStorage.setItem('swaraslam_free_plays', String(truePlays));
+          setFreePlayCount(truePlays);
+          freePlayCountRef.current = truePlays;
+        }
       }
 
       setIsPremium(premium);
@@ -499,6 +515,13 @@ export default function SwaraSlamApp() {
       const nextCount = currentPlays + 1;
       localStorage.setItem('swaraslam_free_plays', String(nextCount));
       freePlayCountRef.current = nextCount;
+      // Mirror to Supabase for logged-in users so count persists across devices
+      if (userRef.current) {
+        supabase.from('profiles')
+          .update({ free_plays_used: nextCount })
+          .eq('id', userRef.current.id)
+          .then(() => {});
+      }
       setFreePlayCount(nextCount);
       console.log('[SwaraSlam] play counted:', nextCount, '/ limit:', FREE_PLAY_LIMIT);
     }
@@ -534,12 +557,10 @@ export default function SwaraSlamApp() {
     setScoredCards(new Set());
     const effectiveBpm = manualBpmRef.current ? bpmRef.current : autoBpm;
     if (!manualBpmRef.current) setBpm(effectiveBpm);
-    engine.resumeCtx();
     setPhase("leadin"); setActiveCard(-1); setDotBeat(-1); setIsPlaying(true);
     setMicActive(true);
-    setTimeout(() => {
-      if (droneOn) engine.startDrone(SA_PITCHES[saIdxRef.current].freq);
-      engine.scheduleBeats(effectiveBpm, LEAD_IN_BEATS + ACTIVE_BEATS,
+    if (droneOn) engine.startDrone(SA_PITCHES[saIdxRef.current].freq);
+    engine.scheduleBeats(effectiveBpm, LEAD_IN_BEATS + ACTIVE_BEATS,
       (_dot, _isDown, seqIdx, sTime) => {
         setDotBeat(_dot);
         if (seqIdx < LEAD_IN_BEATS) { setPhase("leadin"); setActiveCard(-1); }
@@ -555,13 +576,12 @@ export default function SwaraSlamApp() {
         setTimeout(() => {
           setActiveCard(-1);
           setMicActive(false); engine.stopDrone();
-        }, 600);
+        }, 1200);
 
         // Counter now lives in advanceSet level-complete branch (guaranteed path).
         advanceSet(levelRef.current, setNumRef.current);
       }
     );
-    }, 80);
   }, [engine, droneOn, autoBpm, advanceSet]);
 
   const stopPlay = useCallback(() => {
@@ -575,6 +595,7 @@ export default function SwaraSlamApp() {
 
   const handleRetry = useCallback(() => {
     if (isPlaying) { engine.stopScheduler(); engine.stopDrone(); setIsPlaying(false); setMicActive(false); }
+    engine.warmUp();
     setTimeout(() => startPlay(currentCards || cards), 80);
   }, [isPlaying, engine, currentCards, cards, startPlay]);
 
@@ -1178,7 +1199,10 @@ export default function SwaraSlamApp() {
             <div className="play-row">
               <button className="nav-btn" onClick={handleRetry} disabled={isPlaying || isLocked} aria-label="Retry"><SkipBack /></button>
               <button className={"play-btn" + (isPlaying ? " playing" : "")}
-                onClick={() => isPlaying ? stopPlay() : startPlay(null)}
+                onClick={() => {
+                  if (isPlaying) { stopPlay(); }
+                  else { engine.warmUp(); startPlay(null); }
+                }}
                 disabled={isLocked} aria-label={isPlaying ? "Stop" : "Play"}>
                 {isPlaying ? <Pause /> : <Play />}
               </button>
