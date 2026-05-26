@@ -23,7 +23,7 @@ export default function useAudioEngine() {
   const startDrone = useCallback((freq) => {
     stopDrone();
     const ctx = getCtx(), master = ctx.createGain();
-    master.gain.setValueAtTime(0.38, ctx.currentTime);
+    master.gain.setValueAtTime(0.22, ctx.currentTime);
     master.connect(ctx.destination);
     [[1,.28],[2,.11],[3,.06],[5,.035]].forEach(([m,a]) => {
       const o = ctx.createOscillator(), g = ctx.createGain();
@@ -42,17 +42,41 @@ export default function useAudioEngine() {
 
   const playGuruNote = useCallback((freq, t) => {
     const ctx = getCtx(), master = ctx.createGain();
+    // Soft attack, hold, gentle release — harmonium-like envelope
     master.gain.setValueAtTime(0, t);
-    master.gain.linearRampToValueAtTime(0.13, t + 0.035);
-master.gain.setValueAtTime(0.10, t + 0.10);
+    master.gain.linearRampToValueAtTime(0.11, t + 0.08);
+    master.gain.setValueAtTime(0.09, t + 0.18);
     master.gain.linearRampToValueAtTime(0, t + NOTE_DUR);
     master.connect(ctx.destination);
-    [[1,1.0],[2,0.26],[3,0.07]].forEach(([m,a]) => {
+    // Harmonium harmonic series: fundamental + warm overtones
+    // [multiplier, amplitude] — more overtones than before,
+    // with a slight detune on upper harmonics for warmth
+    [
+      [1,   1.00],   // fundamental
+      [2,   0.55],   // octave — strong in harmonium
+      [3,   0.25],   // fifth above octave
+      [4,   0.14],   // two octaves
+      [5,   0.08],   // major third above two octaves
+      [6,   0.04],   // fifth above two octaves
+    ].forEach(([m, a]) => {
       const o = ctx.createOscillator(), g = ctx.createGain();
-      o.type = "sine"; o.frequency.setValueAtTime(freq*m, t);
-      g.gain.setValueAtTime(a, t); o.connect(g); g.connect(master);
-      o.start(t); o.stop(t + NOTE_DUR + 0.02);
+      o.type = "triangle";  // triangle wave is warmer/softer than sine
+      // Slight detune on upper harmonics for organic warmth
+      const detuneCents = m > 2 ? (m % 2 === 0 ? 3 : -3) : 0;
+      o.frequency.setValueAtTime(freq * m, t);
+      o.detune.setValueAtTime(detuneCents, t);
+      g.gain.setValueAtTime(a * 0.13, t);
+      o.connect(g); g.connect(master);
+      o.start(t); o.stop(t + NOTE_DUR + 0.05);
     });
+    // Add a low-pass filter to soften high frequencies — key for harmonium feel
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(freq * 7, t);
+    filter.Q.setValueAtTime(0.8, t);
+    master.disconnect();
+    master.connect(filter);
+    filter.connect(ctx.destination);
   }, [getCtx]);
 
   const scheduleBeats = useCallback((bpm, totalBeats, onBeat, onDone) => {

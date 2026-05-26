@@ -19,6 +19,7 @@ export default function usePitchDetection({ isActive, targetFreq }) {
   const bufferRef      = useRef(null);
   const isActiveRef    = useRef(isActive);
   const targetFreqRef  = useRef(targetFreq);
+  const matchStreakRef = useRef(0);
 
   isActiveRef.current   = isActive;
   targetFreqRef.current = targetFreq;
@@ -92,10 +93,16 @@ export default function usePitchDetection({ isActive, targetFreq }) {
     const analyser   = analyserRef.current;
     const sampleRate = audioCtxRef.current?.sampleRate ?? 44100;
     const loop = () => {
-      if (!isActiveRef.current) { setIsMatch(false); return; }
+      if (!isActiveRef.current) { matchStreakRef.current = 0; setIsMatch(false); return; }
       rafRef.current = requestAnimationFrame(loop);
       const hz = detectPitch(analyser, sampleRate);
-      setIsMatch(checkMatchAcrossOctaves(hz, targetFreqRef.current));
+      if (checkMatchAcrossOctaves(hz, targetFreqRef.current)) {
+        matchStreakRef.current++;
+        if (matchStreakRef.current >= 3) setIsMatch(true);
+      } else {
+        matchStreakRef.current = 0;
+        setIsMatch(false);
+      }
     };
     rafRef.current = requestAnimationFrame(loop);
   }, [detectPitch, checkMatchAcrossOctaves]);

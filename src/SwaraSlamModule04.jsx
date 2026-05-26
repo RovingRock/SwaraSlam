@@ -154,7 +154,7 @@ export default function SwaraSlamApp() {
   const targetFreq = activeCardData ? SA_PITCHES[saIndex].freq * activeCardData.ratio : -1;
 
   const { isMatch, micError, retryMic } = usePitchDetection({
-    isActive:   micActive && phase === "active" && activeCard >= 0,
+    isActive:   phase === "active" && activeCard >= 0,
     targetFreq: targetFreq > 0 ? targetFreq : 1,
   });
 
@@ -535,10 +535,11 @@ export default function SwaraSlamApp() {
     const effectiveBpm = manualBpmRef.current ? bpmRef.current : autoBpm;
     if (!manualBpmRef.current) setBpm(effectiveBpm);
     engine.resumeCtx();
-    if (droneOn) engine.startDrone(SA_PITCHES[saIdxRef.current].freq);
     setPhase("leadin"); setActiveCard(-1); setDotBeat(-1); setIsPlaying(true);
     setMicActive(true);
-    engine.scheduleBeats(effectiveBpm, LEAD_IN_BEATS + ACTIVE_BEATS,
+    setTimeout(() => {
+      if (droneOn) engine.startDrone(SA_PITCHES[saIdxRef.current].freq);
+      engine.scheduleBeats(effectiveBpm, LEAD_IN_BEATS + ACTIVE_BEATS,
       (_dot, _isDown, seqIdx, sTime) => {
         setDotBeat(_dot);
         if (seqIdx < LEAD_IN_BEATS) { setPhase("leadin"); setActiveCard(-1); }
@@ -550,13 +551,17 @@ export default function SwaraSlamApp() {
         }
       },
       () => {
-        setPhase("done"); setIsPlaying(false); setActiveCard(-1); setDotBeat(-1);
-        setMicActive(false); engine.stopDrone();
+        setPhase("done"); setIsPlaying(false); setDotBeat(-1);
+        setTimeout(() => {
+          setActiveCard(-1);
+          setMicActive(false); engine.stopDrone();
+        }, 600);
 
         // Counter now lives in advanceSet level-complete branch (guaranteed path).
         advanceSet(levelRef.current, setNumRef.current);
       }
     );
+    }, 80);
   }, [engine, droneOn, autoBpm, advanceSet]);
 
   const stopPlay = useCallback(() => {
