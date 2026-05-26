@@ -99,7 +99,9 @@ export default function useAudioEngine() {
 
   const scheduleBeats = useCallback((bpm, totalBeats, onBeat, onDone) => {
     const ctx = getCtx(), spb = 60 / bpm;
-    const schedAhead = 0.25, lookAhead = 40;
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    const schedAhead = isSafari ? 0.40 : 0.25;
+    const lookAhead  = isSafari ? 60   : 40;
     let scheduled = 0;
     const tick = () => {
       while (nextBeatRef.current < ctx.currentTime + schedAhead && scheduled < totalBeats) {
@@ -124,7 +126,16 @@ export default function useAudioEngine() {
         schedTimerRef.current = setTimeout(onDone, doneDelay);
       }
     };
-    nextBeatRef.current = ctx.currentTime + 0.08; beatCountRef.current = 0; tick();
+    beatCountRef.current = 0;
+    const _waitForClock = () => {
+      if (ctx.currentTime > 0) {
+        nextBeatRef.current = ctx.currentTime + 0.08;
+        tick();
+      } else {
+        setTimeout(_waitForClock, 10);
+      }
+    };
+    _waitForClock();
   }, [getCtx]);
 
   const stopScheduler   = useCallback(() => { clearTimeout(schedTimerRef.current); schedTimerRef.current = null; }, []);
