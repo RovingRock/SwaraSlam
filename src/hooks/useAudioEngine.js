@@ -74,9 +74,9 @@ export default function useAudioEngine() {
     const ctx = getCtx(), spb = 60 / bpm;
     const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-    const schedAhead = isSafari ? 0.40 : isMobile ? 0.30 : 0.12;
-    const lookAhead  = isSafari ? 60   : isMobile ? 50   : 25;
-    const startOffset = isMobile ? 0.25 : 0.08;
+    const schedAhead = isSafari ? 0.35 : isMobile ? 0.25 : 0.12;
+    const lookAhead  = isSafari ? 50   : isMobile ? 40   : 25;
+    const startOffset = isSafari ? 0.15 : isMobile ? 0.20 : 0.05;
     let scheduled = 0;
     const tick = () => {
       while (nextBeatRef.current < ctx.currentTime + schedAhead && scheduled < totalBeats) {
