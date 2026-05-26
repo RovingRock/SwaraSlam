@@ -71,17 +71,20 @@ export default function useAudioEngine() {
   const playGuruNote = useCallback((freq, t) => {
     const ctx = getCtx();
     if (ctx.state !== "running") return;
+    // If scheduled time is in the past (mobile timing drift),
+    // reschedule to play immediately with a tiny safety buffer
+    const safeT = Math.max(t, ctx.currentTime + 0.02);
     // Build graph: oscillators → gainNodes → master → filter → destination
     const filter = ctx.createBiquadFilter();
     filter.type = "lowpass";
-    filter.frequency.setValueAtTime(freq * 6, t);
-    filter.Q.setValueAtTime(0.7, t);
+    filter.frequency.setValueAtTime(freq * 6, safeT);
+    filter.Q.setValueAtTime(0.7, safeT);
     filter.connect(ctx.destination);
     const master = ctx.createGain();
-    master.gain.setValueAtTime(0, t);
-    master.gain.linearRampToValueAtTime(0.18, t + 0.06);
-    master.gain.setValueAtTime(0.15, t + 0.20);
-    master.gain.linearRampToValueAtTime(0, t + NOTE_DUR);
+    master.gain.setValueAtTime(0, safeT);
+    master.gain.linearRampToValueAtTime(0.18, safeT + 0.06);
+    master.gain.setValueAtTime(0.15, safeT + 0.20);
+    master.gain.linearRampToValueAtTime(0, safeT + NOTE_DUR);
     master.connect(filter);
     [
       [1, 1.00],
@@ -92,11 +95,11 @@ export default function useAudioEngine() {
     ].forEach(([m, a]) => {
       const o = ctx.createOscillator(), g = ctx.createGain();
       o.type = "triangle";
-      o.frequency.setValueAtTime(freq * m, t);
-      o.detune.setValueAtTime(m > 2 ? (m % 2 === 0 ? 3 : -3) : 0, t);
-      g.gain.setValueAtTime(a * 0.18, t);
+      o.frequency.setValueAtTime(freq * m, safeT);
+      o.detune.setValueAtTime(m > 2 ? (m % 2 === 0 ? 3 : -3) : 0, safeT);
+      g.gain.setValueAtTime(a * 0.18, safeT);
       o.connect(g); g.connect(master);
-      o.start(t); o.stop(t + NOTE_DUR + 0.05);
+      o.start(safeT); o.stop(safeT + NOTE_DUR + 0.05);
     });
   }, [getCtx]);
 
@@ -118,7 +121,9 @@ export default function useAudioEngine() {
           d[i] = Math.sin(2*Math.PI*cf*i/ctx.sampleRate) * Math.exp(-i/(ctx.sampleRate*0.008));
         const src = ctx.createBufferSource(), g = ctx.createGain();
         src.buffer = buf; g.gain.setValueAtTime(isDown ? 0.52 : 0.26, t);
-        src.connect(g); g.connect(ctx.destination); src.start(t);
+        src.connect(g); g.connect(ctx.destination);
+        const safeClickT = Math.max(t, ctx.currentTime + 0.01);
+        src.start(safeClickT);
         const delay = Math.max(0, (t - ctx.currentTime) * 1000);
         const cb = beat, cs = scheduled;
         setTimeout(() => onBeat(cb % 4, isDown, cs, t), delay);
